@@ -1,0 +1,14 @@
+# Admin panel rewrite rules
+# No special rewrites needed - admin panel uses direct .php files
+# This file just ensures directory security
+
+# Prevent directory listing
+Options -Indexes
+
+# Allow access to PHP files in admin directory
+<FilesMatch "\.php$">
+    Require all granted
+</FilesMatch>
+
+# Set default charset
+AddDefaultCharset UTF-8

@@ -1,0 +1,32 @@
+# Root .htaccess - Redirect all requests to public/ directory
+# This is only needed if your DocumentRoot points to the project root
+# instead of the public/ subdirectory
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Redirect all requests to public/ subdirectory
+    RewriteCond %{REQUEST_URI} !^/public/
+    RewriteRule ^(.*)$ /public/$1 [L,QSA]
+</IfModule>
+
+# Deny access to sensitive files in root directory
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>
+
+<Files composer.json>
+    Require all denied
+</Files>
+
+<Files composer.lock>
+    Require all denied
+</Files>
+
+# Deny access to .env file
+<Files .env>
+    Require all denied
+</Files>
+
+# Prevent directory listing
+Options -Indexes

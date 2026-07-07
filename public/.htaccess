@@ -1,0 +1,44 @@
+# OpenLiteSpeed / Apache rewrite rules for License Server
+# Routes all non-file, non-directory requests through index.php
+
+<IfModule mod_rewrite.c>
+    # Enable rewrite engine
+    RewriteEngine On
+
+    # Set base directory (adjust if app is in a subdirectory)
+    RewriteBase /
+
+    # Route API endpoints through index.php
+    # /activate, /validate, /deactivate, /webhook/razorpay
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^(activate|validate|deactivate|webhook/.*)$ index.php [QSA,L]
+
+    # Deny direct access to index.php from browser (optional security measure)
+    # Comment this out if you need to access index.php directly for testing
+    # RewriteCond %{REQUEST_URI} ^/index\.php$
+    # RewriteRule .* - [F,L]
+</IfModule>
+
+# Deny access to sensitive files and directories
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>
+
+# Deny access to .env file if it exists
+<Files .env>
+    Require all denied
+</Files>
+
+# Prevent directory listing
+Options -Indexes
+
+# Set default charset
+AddDefaultCharset UTF-8
+
+# PHP security settings (if using mod_php or LSAPI)
+<IfModule mod_php.c>
+    php_flag display_errors Off
+    php_flag log_errors On
+    php_value error_log /var/log/php_errors.log
+</IfModule>
