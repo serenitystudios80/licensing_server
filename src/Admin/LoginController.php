@@ -214,7 +214,7 @@ final class LoginController
             $stmt = $this->pdo->prepare(
                 'SELECT COUNT(*) FROM admin_login_attempts 
                  WHERE username = ? 
-                   AND succeeded = 0
+                   AND successful = 0
                    AND attempted_at >= ?'
             );
 
@@ -253,7 +253,7 @@ final class LoginController
             $attemptedAt = date('Y-m-d H:i:s', $now);
 
             $stmt = $this->pdo->prepare(
-                'INSERT INTO admin_login_attempts (username, succeeded, attempted_at) 
+                'INSERT INTO admin_login_attempts (username, successful, attempted_at) 
                  VALUES (?, ?, ?)'
             );
 

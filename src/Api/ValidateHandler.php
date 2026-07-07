@@ -8,7 +8,6 @@ use App\Config\Config;
 use App\Domain\LicenseKeyGenerator;
 use App\Domain\StatusCalculator;
 use App\Domain\StatusTransitionApplier;
-use App\Http\Request;
 use App\Http\Response;
 use App\Http\ErrorResponder;
 use App\Repository\LicenseRepository;
@@ -19,18 +18,20 @@ use App\Support\ErrorContext;
 use App\Support\Logger;
 
 /**
- * ValidateHandler - /validate endpoint logic (stages 6-8).
+ * ValidateHandler - POST /validate endpoint.
  *
- * Implements validation with Lazy_Check for status computation:
- * 1. Required fields (license_key, site_hash)
- * 2. Unknown license check
- * 3. Site not found check (before any mutation)
- * 4. Lazy_Check: compute true status via StatusCalculator
- * 5. Apply status transition if changed (self-healing via StatusTransitionApplier)
- * 6. Update last_validated_at
- * 7. Return status + expires_at (exactly matching stored/corrected values)
+ * Validates a license and optionally performs Lazy_Check (status transition
+ * for annual active/grace licenses).
  *
- * Per Requirements 5.1-5.9 and design.md ValidateHandler section.
+ * Flow:
+ * 1. Required fields: license_key, site_hash
+ * 2. Unknown license → license_not_found
+ * 3. Site not found (site_hash lookup) → site_not_activated
+ * 4. Lazy_Check for annual active/grace licenses
+ * 5. Update last_validated_at
+ * 6. Return status and expires_at
+ *
+ * Per Requirements 5.1-5.9 and design.md /validate section.
  */
 final class ValidateHandler
 {
@@ -41,10 +42,8 @@ final class ValidateHandler
     private StatusTransitionApplier $transitionApplier;
     private Clock $clock;
 
-    public function __construct(
-        Config $config,
-        Clock $clock,
-    ) {
+    public function __construct(Config $config, Clock $clock)
+    {
         $this->licenseRepo = new LicenseRepository($config);
         $this->activationRepo = new ActivationRepository($config);
         $this->eventRepo = new LicenseEventRepository($config);
@@ -57,138 +56,120 @@ final class ValidateHandler
     }
 
     /**
-     * Handle /validate request (stages 6-8).
+     * Handle the validation request.
      *
-     * @param Request $request Request with parsed JSON body
-     * @return Response Success or error response
+     * @param array<string, mixed> $payload The validated JSON payload
+     * @return Response
      */
-    public function handle(Request $request): Response
+    public function handle(array $payload): Response
     {
-        // Stage 6: Required fields present?
-        // Per Requirement 5 AC4
-        if (!isset($request->json[FieldNames::LICENSE_KEY])) {
-            return ErrorResponder::badRequest(
-                'Missing required field: ' . FieldNames::LICENSE_KEY . '. ' .
-                'The /validate endpoint requires both license_key and site_hash.'
-            );
+        // Stage 6: Required field validation
+        $licenseKey = $payload[FieldNames::LICENSE_KEY] ?? null;
+        $siteHash = $payload[FieldNames::VALIDATE_SITE_HASH] ?? null;
+
+        if ($licenseKey === null || $licenseKey === '') {
+            return ErrorResponder::badRequest('missing_license_key', 'Missing required field: license_key');
         }
 
-        if (!isset($request->json[FieldNames::SITE_HASH])) {
-            return ErrorResponder::badRequest(
-                'Missing required field: ' . FieldNames::SITE_HASH . '. ' .
-                'The /validate endpoint requires both license_key and site_hash.'
-            );
+        if ($siteHash === null || $siteHash === '') {
+            return ErrorResponder::badRequest('missing_site_hash', 'Missing required field: site_hash');
         }
-
-        $licenseKey = (string) $request->json[FieldNames::LICENSE_KEY];
-        $siteHash = (string) $request->json[FieldNames::SITE_HASH];
 
         // Stage 7: Field format validation
         if (!$this->keyGenerator->isValidFormat($licenseKey)) {
             return ErrorResponder::badRequest(
-                'Invalid license_key format: must match SERB-XXXXX-XXXXX-XXXXX-XXXXX pattern. ' .
-                "Received: {$licenseKey}",
-                'invalid_license_key_format'
+                'invalid_license_key_format',
+                'Invalid license_key format'
             );
         }
 
-        // Validate site_hash format (64-char lowercase hex)
-        if (!preg_match('/^[a-f0-9]{64}$/', $siteHash)) {
+        if (!preg_match('/^[a-f0-9]{64}$/i', $siteHash)) {
             return ErrorResponder::badRequest(
-                'Invalid site_hash format: must be a 64-character lowercase hexadecimal SHA-256 digest. ' .
-                "Received: {$siteHash}",
-                'invalid_site_hash_format'
+                'invalid_site_hash',
+                'Invalid site_hash format (expected 64-char hex)'
             );
         }
 
         // Stage 8: Business rules
-        try {
-            return $this->processValidation($licenseKey, $siteHash);
-        } catch (\Throwable $e) {
-            $context = ErrorContext::describe($e, [
-                'method' => __METHOD__,
-                'license_key' => $licenseKey,
-                'site_hash' => $siteHash,
-            ]);
-            Logger::error($context);
-
-            return ErrorResponder::internalError(
-                'Failed to process validation request: an unexpected error occurred. ' .
-                'Please try again or contact support.',
-                'validation_failed'
-            );
-        }
+        return $this->executeBusinessLogic($licenseKey, $siteHash);
     }
 
     /**
-     * Process validation business logic (stage 8).
-     *
-     * @param string $licenseKey License key
-     * @param string $siteHash Site hash (SHA-256)
-     * @return Response Success or error response
+     * Execute business rules for validation.
      */
-    private function processValidation(string $licenseKey, string $siteHash): Response
+    private function executeBusinessLogic(string $licenseKey, string $siteHash): Response
     {
-        // Unknown license check
-        // Per Requirement 5 AC2
-        $license = $this->licenseRepo->findByKey($licenseKey);
+        try {
+            // 1. Find license
+            $license = $this->licenseRepo->findByKey($licenseKey);
 
-        if ($license === null) {
-            return ErrorResponder::notFound(
-                "Unknown license key: {$licenseKey}. No license found with this key. " .
-                "Please check the key and try again.",
-                'unknown_license'
-            );
-        }
+            if ($license === null) {
+                return ErrorResponder::notFound('license_not_found', 'License key not found');
+            }
 
-        // Site not found check (BEFORE any mutation)
-        // Per Requirement 5 AC3
-        $activation = $this->activationRepo->findActiveByHash($license->id, $siteHash);
+            // 2. Find activation by site_hash
+            $activation = $this->activationRepo->findActiveByHash($siteHash);
 
-        if ($activation === null) {
-            return ErrorResponder::notFound(
-                "Site not found: site_hash {$siteHash} has no active activation for license {$licenseKey}. " .
-                "Please activate this site first using the /activate endpoint.",
-                'site_not_found'
-            );
-        }
+            if ($activation === null) {
+                return ErrorResponder::forbidden(
+                    'site_not_activated',
+                    'This site is not activated for this license'
+                );
+            }
 
-        // Lazy_Check: compute true status via StatusCalculator
-        // Per Requirement 5 AC5, AC6, AC7
-        // Only perform Lazy_Check for annual licenses with active/grace status
-        // (lifetime and revoked are excluded per StatusCalculator::shouldExclude)
-        if (!StatusCalculator::shouldExclude($license)) {
-            $statusComputation = StatusCalculator::compute($license, $this->clock->now());
+            // 3. Verify activation belongs to this license
+            if ($activation->licenseId !== $license->id) {
+                return ErrorResponder::forbidden(
+                    'site_not_activated',
+                    'This site is not activated for this license'
+                );
+            }
 
-            // If status changed, persist it (self-healing)
-            // Per Requirement 11 AC1: Lazy_Check persists corrected status
-            if ($statusComputation->changed) {
-                $this->transitionApplier->apply($license, $statusComputation, 'lazy_check');
+            // 4. Lazy_Check: Only for annual, non-revoked licenses in active/grace status
+            if ($license->tier === 'annual' && 
+                $license->status !== 'revoked' && 
+                in_array($license->status, ['active', 'grace'], true)) {
+                
+                $now = $this->clock->now();
+                $computation = StatusCalculator::compute($license, $now);
 
-                // Refresh license to get updated status/grace_start_at
-                $license = $this->licenseRepo->findById($license->id);
-
-                if ($license === null) {
-                    // Should never happen, but handle gracefully
-                    return ErrorResponder::internalError(
-                        'Failed to retrieve license after status transition.',
-                        'internal_error'
+                if ($computation->changed) {
+                    // Apply status transition
+                    $this->transitionApplier->apply(
+                        $license->id,
+                        $computation,
+                        'silent_lapse_grace' // Event type for Lazy_Check
                     );
+
+                    // Refetch license to get updated status
+                    $license = $this->licenseRepo->findById($license->id);
                 }
             }
+
+            // 5. Update last_validated_at on activation
+            $now = gmdate('Y-m-d H:i:s', $this->clock->now());
+            
+            // Update activation's last_validated_at
+            // Note: We need to update the activation, not through LicenseRepository
+            $stmt = $this->activationRepo->update($activation->id, [
+                'last_validated_at' => $now,
+            ]);
+
+            // 6. Return current status
+            return Response::json([
+                'success' => true,
+                'status' => $license->status,
+                'expires_at' => $license->expiresAt,
+                'tier' => $license->tier,
+            ]);
+        } catch (\RuntimeException $e) {
+            $context = ErrorContext::describe($e, [
+                'method' => __METHOD__,
+                'license_key' => $licenseKey,
+            ]);
+            Logger::error($context);
+
+            return ErrorResponder::internalError('Failed to validate license');
         }
-
-        // Update last_validated_at
-        // Per Requirement 5 AC1
-        $now = date('Y-m-d H:i:s', $this->clock->now());
-        $this->activationRepo->updateLastValidated($activation->id, $now);
-
-        // Build response with status and expires_at
-        // Per Requirement 5 AC8: values must EXACTLY match stored (or Lazy_Check-corrected) values
-        // Per Requirement 5 AC9: revoked licenses still respond (with status revoked)
-        return Response::json([
-            FieldNames::STATUS => $license->status,
-            FieldNames::EXPIRES_AT => $license->expiresAt,
-        ]);
     }
 }

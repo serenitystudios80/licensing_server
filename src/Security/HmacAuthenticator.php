@@ -8,220 +8,134 @@ use App\Http\Request;
 use App\Support\Clock;
 
 /**
- * HmacAuthenticator - HMAC-SHA256 request signature verification.
+ * HmacAuthenticator - HMAC-SHA256 signature verification for API requests.
  *
- * Implements stage 5 of the API pipeline (after rate limiting, before business logic).
+ * Implements 3-step ordered validation (Requirement 3 AC7):
+ * 1. Field presence/format check (X-Timestamp and X-Signature headers)
+ * 2. Timestamp within ±300s window
+ * 3. Signature verification using hash_equals() for timing-attack safety
  *
- * CRITICAL: Verification follows a FIXED 3-step order (Requirement 3 AC7):
- * 1. Field presence/format validation (timestamp and signature headers exist, timestamp is integer)
- * 2. Timestamp expiry check (within ±300s of current time)
- * 3. Signature verification (constant-time comparison of computed vs. provided signature)
+ * Signature is computed over: "{timestamp}.{rawBody}"
  *
- * Short-circuit evaluation: stops at first failure, does NOT proceed to subsequent checks.
- *
- * Signature is computed over: "{timestamp}.{rawBody}" using HMAC-SHA256 with shared secret.
- *
- * SECURITY RULES:
- * - Never logs the shared secret
- * - Never returns the secret in any result
- * - Uses hash_equals() for constant-time comparison (prevents timing attacks)
- * - 300-second window prevents replay attacks (Requirement 3 AC3)
- *
- * Per Requirements 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7 and design.md HmacAuthenticator section.
+ * Per Requirements 3.1-3.7 and design.md Security section.
  */
 final class HmacAuthenticator
 {
     /**
-     * Timestamp window: ±300 seconds (5 minutes).
-     * Per Requirement 3 AC3.
+     * Maximum allowed time skew in seconds (±300s = ±5 minutes).
      */
-    private const TIMESTAMP_WINDOW = 300;
+    private const MAX_TIME_SKEW = 300;
 
-    /**
-     * Header name for timestamp (provisional - see design.md).
-     */
-    private const TIMESTAMP_HEADER = 'X-Serb-Timestamp';
+    private Clock $clock;
 
-    /**
-     * Header name for signature (provisional - see design.md).
-     */
-    private const SIGNATURE_HEADER = 'X-Serb-Signature';
-
-    public function __construct(
-        private Clock $clock,
-    ) {
+    public function __construct(Clock $clock)
+    {
+        $this->clock = $clock;
     }
 
     /**
-     * Verify HMAC authentication for a request.
+     * Verify HMAC signature on a request.
      *
-     * Performs the 3-step verification in fixed order (short-circuit on first failure):
+     * Returns a Result indicating success or failure with specific error codes.
+     *
+     * Fixed 3-step order (never logs or returns the secret):
      * 1. Field presence/format
-     * 2. Timestamp expiry (±300s)
-     * 3. Signature verification (constant-time)
+     * 2. Timestamp validation (±300s)
+     * 3. Signature verification (constant-time comparison)
      *
      * @param Request $request The incoming request
-     * @param string $secret HMAC shared secret (never logged or returned)
-     * @return HmacResult Verification result (ok, malformed, expired, or invalid_signature)
+     * @param string $secret The shared HMAC secret
+     * @return HmacResult Success or failure with error details
      */
     public function verify(Request $request, string $secret): HmacResult
     {
-        // Step 1: Field presence/format validation
-        $timestampHeader = $request->getHeader(self::TIMESTAMP_HEADER);
-        $signatureHeader = $request->getHeader(self::SIGNATURE_HEADER);
+        // Step 1: Field presence and format validation
+        $timestamp = $request->getHeader('X-Timestamp');
+        $signature = $request->getHeader('X-Signature');
 
-        if ($timestampHeader === null) {
-            return HmacResult::malformed(
-                'Missing required header: ' . self::TIMESTAMP_HEADER . '. ' .
-                'HMAC authentication requires timestamp and signature headers.'
+        if ($timestamp === null || $signature === null) {
+            return HmacResult::failure(
+                'missing_hmac_fields',
+                'Missing required HMAC headers: X-Timestamp and X-Signature'
             );
         }
 
-        if ($signatureHeader === null) {
-            return HmacResult::malformed(
-                'Missing required header: ' . self::SIGNATURE_HEADER . '. ' .
-                'HMAC authentication requires timestamp and signature headers.'
+        // Validate timestamp format (must be numeric)
+        if (!ctype_digit($timestamp)) {
+            return HmacResult::failure(
+                'invalid_timestamp_format',
+                'X-Timestamp must be a Unix timestamp (numeric)'
             );
         }
 
-        // Timestamp must be a valid integer
-        if (!ctype_digit($timestampHeader)) {
-            return HmacResult::malformed(
-                'Invalid timestamp format in ' . self::TIMESTAMP_HEADER . ': must be a Unix epoch integer (seconds). ' .
-                "Received: {$timestampHeader}"
-            );
-        }
+        $timestampInt = (int) $timestamp;
 
-        $timestamp = (int) $timestampHeader;
-        $providedSignature = $signatureHeader;
-
-        // Step 2: Timestamp expiry check (±300s)
+        // Step 2: Timestamp validation (within ±300s window)
         $now = $this->clock->now();
-        $timeDiff = abs($now - $timestamp);
+        $timeDiff = abs($now - $timestampInt);
 
-        if ($timeDiff > self::TIMESTAMP_WINDOW) {
-            $direction = $timestamp < $now ? 'past' : 'future';
-            return HmacResult::expired(
-                "Request timestamp expired: {$timeDiff} seconds difference from server time " .
-                "(max allowed: " . self::TIMESTAMP_WINDOW . " seconds). " .
-                "Request timestamp is too far in the {$direction}. " .
-                "Check client system clock synchronization."
+        if ($timeDiff > self::MAX_TIME_SKEW) {
+            return HmacResult::failure(
+                'timestamp_out_of_range',
+                'Request timestamp is outside the allowed ±300s window'
             );
         }
 
-        // Step 3: Signature verification (constant-time)
+        // Step 3: Signature verification
         $expectedSignature = $this->computeSignature($timestamp, $request->rawBody, $secret);
 
-        if (!hash_equals($expectedSignature, strtolower($providedSignature))) {
-            return HmacResult::invalidSignature(
-                'HMAC signature verification failed. The provided signature does not match the expected value. ' .
-                'Check that the shared secret matches on both client and server, and that the signature is ' .
-                'computed over "{timestamp}.{rawBody}" using HMAC-SHA256.'
+        // Use hash_equals() for constant-time comparison (timing-attack prevention)
+        if (!hash_equals($expectedSignature, $signature)) {
+            return HmacResult::failure(
+                'invalid_signature',
+                'HMAC signature verification failed'
             );
         }
 
         // All checks passed
-        return HmacResult::ok();
+        return HmacResult::success();
     }
 
     /**
-     * Compute HMAC-SHA256 signature for a timestamp and body.
+     * Compute HMAC signature for a request.
      *
      * Signature is computed over: "{timestamp}.{rawBody}"
-     * (timestamp as integer string, literal dot, raw request body).
+     * using HMAC-SHA256 with the shared secret.
      *
-     * Returns lowercase hexadecimal string.
+     * This is used both for verification (server-side) and for generating
+     * signatures (client-side, when testing).
      *
-     * This method is public for client-side signature generation (not just verification).
-     *
-     * @param int $timestamp Unix epoch timestamp (seconds)
-     * @param string $body Raw request body
-     * @param string $secret HMAC shared secret
-     * @return string Lowercase hex signature
+     * @param string $timestamp Unix timestamp as string
+     * @param string $rawBody Raw request body
+     * @param string $secret Shared HMAC secret
+     * @return string Hex-encoded HMAC signature (64 characters)
      */
-    public function computeSignature(int $timestamp, string $body, string $secret): string
+    public function computeSignature(string $timestamp, string $rawBody, string $secret): string
     {
-        $message = "{$timestamp}.{$body}";
+        $message = "{$timestamp}.{$rawBody}";
         return hash_hmac('sha256', $message, $secret);
-    }
-
-    /**
-     * Get the timestamp window in seconds (for testing/documentation).
-     *
-     * @return int Timestamp window (300 seconds = 5 minutes)
-     */
-    public static function getTimestampWindow(): int
-    {
-        return self::TIMESTAMP_WINDOW;
-    }
-
-    /**
-     * Get the timestamp header name (for client integration).
-     *
-     * @return string Header name (provisional)
-     */
-    public static function getTimestampHeader(): string
-    {
-        return self::TIMESTAMP_HEADER;
-    }
-
-    /**
-     * Get the signature header name (for client integration).
-     *
-     * @return string Header name (provisional)
-     */
-    public static function getSignatureHeader(): string
-    {
-        return self::SIGNATURE_HEADER;
     }
 }
 
 /**
- * HmacResult - HMAC verification result.
- *
- * Returned by HmacAuthenticator::verify() to indicate verification outcome.
+ * HmacResult - Result of HMAC verification.
  */
 final readonly class HmacResult
 {
     private function __construct(
-        public HmacStatus $status,
+        public bool $success,
+        public ?string $errorCode,
         public ?string $errorMessage,
     ) {
     }
 
-    public static function ok(): self
+    public static function success(): self
     {
-        return new self(HmacStatus::OK, null);
+        return new self(true, null, null);
     }
 
-    public static function malformed(string $message): self
+    public static function failure(string $code, string $message): self
     {
-        return new self(HmacStatus::MALFORMED, $message);
+        return new self(false, $code, $message);
     }
-
-    public static function expired(string $message): self
-    {
-        return new self(HmacStatus::EXPIRED, $message);
-    }
-
-    public static function invalidSignature(string $message): self
-    {
-        return new self(HmacStatus::INVALID_SIGNATURE, $message);
-    }
-
-    public function isOk(): bool
-    {
-        return $this->status === HmacStatus::OK;
-    }
-}
-
-/**
- * HmacStatus - HMAC verification status enum.
- */
-enum HmacStatus
-{
-    case OK;
-    case MALFORMED;
-    case EXPIRED;
-    case INVALID_SIGNATURE;
 }

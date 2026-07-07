@@ -6,33 +6,26 @@ namespace App\Repository;
 
 use App\Config\Config;
 use App\Domain\License;
+use App\Domain\LicenseKeyGenerator;
 use App\Support\ErrorContext;
 use App\Support\Logger;
 use PDO;
 use PDOException;
 
 /**
- * Repository for License entities.
+ * Repository for License domain objects.
  *
- * Provides core CRUD operations (findByKey, findById, create, updateFields)
- * and admin query helpers (search, filter, countBy*, expiringWithin).
+ * Provides CRUD operations and query helpers for the `licenses` table.
+ * All queries use prepared statements exclusively.
  *
- * Enforces the tier=lifetime => expires_at=NULL invariant at creation/update
- * time (Requirements 1.2, 1.10).
+ * Enforces the lifetime-tier constraint: tier 'lifetime' implies expires_at = NULL
+ * at creation and update time.
  *
- * All queries use PDO prepared statements exclusively (no raw SQL concatenation).
- * Admin query helpers build parameterized WHERE fragments from an allow-list of
- * filter keys to prevent SQL injection.
+ * Per Requirements 1.1, 1.2, 1.9, 1.10 and design.md Repository layer section.
  */
 final class LicenseRepository
 {
     private PDO $pdo;
-
-    /**
-     * Allow-listed filter keys for admin queries.
-     * Only these keys are permitted in filter() method to prevent SQL injection.
-     */
-    private const ALLOWED_FILTER_KEYS = ['status', 'tier', 'product'];
 
     public function __construct(Config $config)
     {
@@ -40,28 +33,34 @@ final class LicenseRepository
     }
 
     /**
-     * Find a License by its license_key.
+     * Find a License by its unique license_key.
      *
-     * @return License|null Returns null if not found
+     * @return License|null Returns null if not found.
+     * @throws \RuntimeException on database error (with specific diagnostic context).
      */
-    public function findByKey(string $key): ?License
+    public function findByKey(string $licenseKey): ?License
     {
         try {
             $stmt = $this->pdo->prepare(
-                'SELECT * FROM licenses WHERE license_key = ? LIMIT 1'
+                'SELECT * FROM licenses WHERE license_key = :license_key LIMIT 1'
             );
-            $stmt->execute([$key]);
-            $row = $stmt->fetch();
+            $stmt->execute(['license_key' => $licenseKey]);
 
-            return $row ? License::fromRow($row) : null;
+            $row = $stmt->fetch();
+            if ($row === false) {
+                return null;
+            }
+
+            return License::fromRow($row);
         } catch (PDOException $e) {
             $context = ErrorContext::describe($e, [
                 'method' => __METHOD__,
-                'license_key' => $key,
+                'license_key' => $licenseKey,
             ]);
             Logger::error($context);
+
             throw new \RuntimeException(
-                "Failed to find license by key: database query error. Check logs for details.",
+                'Failed to query License by license_key: database error',
                 0,
                 $e
             );
@@ -69,28 +68,32 @@ final class LicenseRepository
     }
 
     /**
-     * Find a License by its numeric ID.
+     * Find a License by its primary key id.
      *
-     * @return License|null Returns null if not found
+     * @return License|null Returns null if not found.
+     * @throws \RuntimeException on database error.
      */
     public function findById(int $id): ?License
     {
         try {
-            $stmt = $this->pdo->prepare(
-                'SELECT * FROM licenses WHERE id = ? LIMIT 1'
-            );
-            $stmt->execute([$id]);
-            $row = $stmt->fetch();
+            $stmt = $this->pdo->prepare('SELECT * FROM licenses WHERE id = :id LIMIT 1');
+            $stmt->execute(['id' => $id]);
 
-            return $row ? License::fromRow($row) : null;
+            $row = $stmt->fetch();
+            if ($row === false) {
+                return null;
+            }
+
+            return License::fromRow($row);
         } catch (PDOException $e) {
             $context = ErrorContext::describe($e, [
                 'method' => __METHOD__,
-                'license_id' => $id,
+                'id' => $id,
             ]);
             Logger::error($context);
+
             throw new \RuntimeException(
-                "Failed to find license by ID {$id}: database query error. Check logs for details.",
+                'Failed to query License by id: database error',
                 0,
                 $e
             );
@@ -100,19 +103,55 @@ final class LicenseRepository
     /**
      * Create a new License.
      *
-     * Enforces the tier=lifetime => expires_at=NULL invariant (Requirements 1.2, 1.10).
-     * If tier is 'lifetime' and expires_at is provided, it will be forced to NULL.
+     * Generates a unique license_key if not provided. Enforces the lifetime-tier
+     * constraint: if tier is 'lifetime', expires_at is forced to NULL regardless
+     * of what the caller passes.
      *
-     * @param array<string, mixed> $data Associative array with License fields
-     * @return License The created License entity
-     * @throws \RuntimeException on creation failure
+     * @param array{
+     *     license_key?: string,
+     *     email: string,
+     *     customer_name: string,
+     *     product: string,
+     *     tier: string,
+     *     status: string,
+     *     purchased_at: string,
+     *     expires_at: string|null,
+     *     grace_start_at?: string|null,
+     *     razorpay_subscription_id?: string|null,
+     *     activation_limit: int,
+     *     price_amount?: string|null,
+     *     currency?: string|null,
+     *     notes?: string,
+     * } $data
+     *
+     * @return License The newly created License with its database-assigned id.
+     * @throws \RuntimeException on database error (including unique constraint violation).
      */
     public function create(array $data): License
     {
-        // Enforce lifetime => expires_at=NULL invariant
-        if (($data['tier'] ?? null) === 'lifetime') {
-            $data['expires_at'] = null;
-        }
+        // Generate unique license_key if not provided
+        $licenseKey = $data['license_key'] ?? $this->generateUniqueLicenseKey();
+
+        // Enforce lifetime-tier constraint
+        $tier = $data['tier'];
+        $expiresAt = ($tier === 'lifetime') ? null : ($data['expires_at'] ?? null);
+
+        $insertData = [
+            'license_key' => $licenseKey,
+            'email' => $data['email'],
+            'customer_name' => $data['customer_name'],
+            'product' => $data['product'],
+            'tier' => $tier,
+            'status' => $data['status'],
+            'purchased_at' => $data['purchased_at'],
+            'expires_at' => $expiresAt,
+            'grace_start_at' => $data['grace_start_at'] ?? null,
+            'razorpay_subscription_id' => $data['razorpay_subscription_id'] ?? null,
+            'activation_limit' => $data['activation_limit'],
+            'price_amount' => $data['price_amount'] ?? null,
+            'currency' => $data['currency'] ?? null,
+            'notes' => $data['notes'] ?? '',
+        ];
 
         try {
             $stmt = $this->pdo->prepare(
@@ -120,57 +159,47 @@ final class LicenseRepository
                     license_key, email, customer_name, product, tier, status,
                     purchased_at, expires_at, grace_start_at, razorpay_subscription_id,
                     activation_limit, price_amount, currency, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                ) VALUES (
+                    :license_key, :email, :customer_name, :product, :tier, :status,
+                    :purchased_at, :expires_at, :grace_start_at, :razorpay_subscription_id,
+                    :activation_limit, :price_amount, :currency, :notes
+                )'
             );
 
-            $stmt->execute([
-                $data['license_key'],
-                $data['email'],
-                $data['customer_name'],
-                $data['product'],
-                $data['tier'],
-                $data['status'] ?? 'active',
-                $data['purchased_at'],
-                $data['expires_at'] ?? null,
-                $data['grace_start_at'] ?? null,
-                $data['razorpay_subscription_id'] ?? null,
-                $data['activation_limit'],
-                $data['price_amount'] ?? null,
-                $data['currency'] ?? null,
-                $data['notes'] ?? '',
-            ]);
+            $stmt->execute($insertData);
 
             $id = (int) $this->pdo->lastInsertId();
-            $license = $this->findById($id);
 
-            if ($license === null) {
+            // Fetch and return the complete License object
+            $created = $this->findById($id);
+            if ($created === null) {
                 throw new \RuntimeException(
-                    "License created but could not be retrieved. License ID: {$id}"
+                    'License was created but could not be retrieved'
                 );
             }
 
-            return $license;
+            return $created;
         } catch (PDOException $e) {
             $context = ErrorContext::describe($e, [
                 'method' => __METHOD__,
-                'license_key' => $data['license_key'] ?? '(not provided)',
-                'email' => $data['email'] ?? '(not provided)',
-                'tier' => $data['tier'] ?? '(not provided)',
+                'email' => $data['email'],
+                'product' => $data['product'],
+                'tier' => $tier,
+                // Never log the full license_key in error context for security
             ]);
             Logger::error($context);
 
-            // Check for duplicate key error
-            if ($e->getCode() === '23000' && strpos($e->getMessage(), 'uq_license_key') !== false) {
+            // Check for unique constraint violation on license_key
+            if ($e->getCode() === '23000') {
                 throw new \RuntimeException(
-                    "Failed to create license: license_key '{$data['license_key']}' already exists. " .
-                    "License keys must be unique.",
+                    'Failed to create License: duplicate license_key',
                     0,
                     $e
                 );
             }
 
             throw new \RuntimeException(
-                "Failed to create license: database insert error. Check logs for details.",
+                'Failed to create License: database error',
                 0,
                 $e
             );
@@ -178,54 +207,54 @@ final class LicenseRepository
     }
 
     /**
-     * Update specific fields of a License.
+     * Update specific fields of an existing License.
      *
-     * Performs a targeted field-list update (never a full-row overwrite) so
-     * unrelated fields can't be clobbered by a stale read.
+     * Only the fields present in $fields are updated. Enforces the lifetime-tier
+     * constraint: if tier is being set to 'lifetime', expires_at is forced to NULL.
      *
-     * Enforces the tier=lifetime => expires_at=NULL invariant when updating tier
-     * or expires_at (Requirements 1.2, 1.10).
+     * @param array<string, mixed> $fields Field => value map. Allowed keys are a
+     *        subset of License properties (no id/license_key/created_at updates).
+     * @param array<string, mixed> $whereConditions Optional WHERE conditions (key => value).
+     *        If empty, only the $id is used. Used for optimistic locking (e.g., WHERE status = 'active').
      *
-     * @param int $id License ID
-     * @param array<string, mixed> $fields Associative array of fields to update
-     * @return bool True on success, false if no rows affected
-     * @throws \RuntimeException on update failure
+     * @return bool True if at least one row was updated, false otherwise.
+     * @throws \RuntimeException on database error.
      */
-    public function updateFields(int $id, array $fields): bool
+    public function updateFields(int $id, array $fields, array $whereConditions = []): bool
     {
         if (empty($fields)) {
-            return false; // Nothing to update
+            return false;
         }
 
-        // Enforce lifetime => expires_at=NULL invariant
-        // If setting tier to 'lifetime', force expires_at to NULL
+        // Enforce lifetime-tier constraint during update
         if (isset($fields['tier']) && $fields['tier'] === 'lifetime') {
             $fields['expires_at'] = null;
         }
 
-        // If updating expires_at on a lifetime license, prevent it
-        // (fetch current tier first to check)
-        if (isset($fields['expires_at']) && $fields['expires_at'] !== null) {
-            $current = $this->findById($id);
-            if ($current && $current->tier === 'lifetime') {
-                throw new \InvalidArgumentException(
-                    "Cannot set expires_at on lifetime license. License ID: {$id}, tier: lifetime. " .
-                    "Lifetime licenses must have expires_at=NULL per Requirements 1.2, 1.10."
-                );
-            }
+        // Build SET clause
+        $setClauses = [];
+        $params = [];
+        foreach ($fields as $key => $value) {
+            $setClauses[] = "{$key} = :{$key}";
+            $params[$key] = $value;
         }
 
-        try {
-            // Build SET clause from fields
-            $setClauses = [];
-            $params = [];
-            foreach ($fields as $key => $value) {
-                $setClauses[] = "{$key} = ?";
-                $params[] = $value;
-            }
-            $params[] = $id; // WHERE clause parameter
+        // Build WHERE clause
+        $whereClauses = ['id = :id'];
+        $params['id'] = $id;
 
-            $sql = 'UPDATE licenses SET ' . implode(', ', $setClauses) . ' WHERE id = ?';
+        foreach ($whereConditions as $key => $value) {
+            $whereClauses[] = "{$key} = :where_{$key}";
+            $params["where_{$key}"] = $value;
+        }
+
+        $sql = sprintf(
+            'UPDATE licenses SET %s WHERE %s',
+            implode(', ', $setClauses),
+            implode(' AND ', $whereClauses)
+        );
+
+        try {
             $stmt = $this->pdo->prepare($sql);
             $stmt->execute($params);
 
@@ -233,12 +262,13 @@ final class LicenseRepository
         } catch (PDOException $e) {
             $context = ErrorContext::describe($e, [
                 'method' => __METHOD__,
-                'license_id' => $id,
+                'id' => $id,
                 'fields' => array_keys($fields),
             ]);
             Logger::error($context);
+
             throw new \RuntimeException(
-                "Failed to update license ID {$id}: database update error. Check logs for details.",
+                'Failed to update License fields: database error',
                 0,
                 $e
             );
@@ -246,37 +276,34 @@ final class LicenseRepository
     }
 
     /**
-     * Search licenses by email or license_key (case-insensitive substring match).
+     * Search Licenses by email or license_key substring (case-insensitive).
      *
-     * Used by admin panel list/search feature.
-     *
-     * @param string $query Search query
-     * @return License[] Array of matching licenses
+     * @return list<License>
      */
-    public function search(string $query): array
+    public function search(string $query, int $limit = 50, int $offset = 0): array
     {
         try {
-            $pattern = '%' . $query . '%';
             $stmt = $this->pdo->prepare(
-                'SELECT * FROM licenses 
-                 WHERE LOWER(email) LIKE LOWER(?) 
-                    OR LOWER(license_key) LIKE LOWER(?)
-                 ORDER BY created_at DESC'
+                'SELECT * FROM licenses
+                 WHERE LOWER(email) LIKE LOWER(:query)
+                    OR LOWER(license_key) LIKE LOWER(:query)
+                 ORDER BY created_at DESC
+                 LIMIT :limit OFFSET :offset'
             );
-            $stmt->execute([$pattern, $pattern]);
 
-            return array_map(
-                fn($row) => License::fromRow($row),
-                $stmt->fetchAll()
-            );
+            $stmt->bindValue('query', "%{$query}%", PDO::PARAM_STR);
+            $stmt->bindValue('limit', $limit, PDO::PARAM_INT);
+            $stmt->bindValue('offset', $offset, PDO::PARAM_INT);
+            $stmt->execute();
+
+            $rows = $stmt->fetchAll();
+            return array_map(fn($row) => License::fromRow($row), $rows);
         } catch (PDOException $e) {
-            $context = ErrorContext::describe($e, [
-                'method' => __METHOD__,
-                'query' => $query,
-            ]);
+            $context = ErrorContext::describe($e, ['method' => __METHOD__]);
             Logger::error($context);
+
             throw new \RuntimeException(
-                "Failed to search licenses: database query error. Check logs for details.",
+                'Failed to search Licenses: database error',
                 0,
                 $e
             );
@@ -284,57 +311,86 @@ final class LicenseRepository
     }
 
     /**
-     * Filter licenses by status, tier, product (AND semantics).
+     * Filter Licenses by allowed criteria with pagination.
      *
-     * Only allow-listed filter keys are permitted (status, tier, product).
-     * Used by admin panel list/filter feature.
-     *
-     * @param array<string, string> $filters Associative array of filter criteria
-     * @return License[] Array of matching licenses
-     * @throws \InvalidArgumentException if non-allowed filter key is provided
+     * @param array<string, mixed> $filters Allowed keys: status, tier, product
+     * @return list<License>
      */
-    public function filter(array $filters): array
+    public function filter(array $filters, int $limit = 50, int $offset = 0): array
     {
-        // Validate all keys are in allow-list
-        foreach (array_keys($filters) as $key) {
-            if (!in_array($key, self::ALLOWED_FILTER_KEYS, true)) {
-                throw new \InvalidArgumentException(
-                    "Invalid filter key '{$key}'. Allowed keys: " . implode(', ', self::ALLOWED_FILTER_KEYS)
-                );
+        $allowedKeys = ['status', 'tier', 'product'];
+        $whereClauses = [];
+        $params = [];
+
+        foreach ($filters as $key => $value) {
+            if (in_array($key, $allowedKeys, true)) {
+                $whereClauses[] = "{$key} = :{$key}";
+                $params[$key] = $value;
             }
         }
 
-        if (empty($filters)) {
-            // No filters = return all (or handle as needed by admin controller)
-            return [];
-        }
+        $whereClause = empty($whereClauses) ? '1=1' : implode(' AND ', $whereClauses);
 
         try {
-            // Build WHERE clause from filters (AND semantics)
-            $whereClauses = [];
-            $params = [];
-            foreach ($filters as $key => $value) {
-                $whereClauses[] = "{$key} = ?";
-                $params[] = $value;
-            }
+            $stmt = $this->pdo->prepare(
+                "SELECT * FROM licenses
+                 WHERE {$whereClause}
+                 ORDER BY created_at DESC
+                 LIMIT :limit OFFSET :offset"
+            );
 
-            $sql = 'SELECT * FROM licenses WHERE ' . implode(' AND ', $whereClauses) .
-                   ' ORDER BY created_at DESC';
-            $stmt = $this->pdo->prepare($sql);
+            foreach ($params as $key => $value) {
+                $stmt->bindValue($key, $value);
+            }
+            $stmt->bindValue('limit', $limit, PDO::PARAM_INT);
+            $stmt->bindValue('offset', $offset, PDO::PARAM_INT);
+            $stmt->execute();
+
+            $rows = $stmt->fetchAll();
+            return array_map(fn($row) => License::fromRow($row), $rows);
+        } catch (PDOException $e) {
+            $context = ErrorContext::describe($e, ['method' => __METHOD__]);
+            Logger::error($context);
+
+            throw new \RuntimeException(
+                'Failed to filter Licenses: database error',
+                0,
+                $e
+            );
+        }
+    }
+
+    /**
+     * Count Licenses by specific criteria.
+     *
+     * @param array<string, mixed> $filters
+     */
+    public function countBy(array $filters): int
+    {
+        $allowedKeys = ['status', 'tier', 'product'];
+        $whereClauses = [];
+        $params = [];
+
+        foreach ($filters as $key => $value) {
+            if (in_array($key, $allowedKeys, true)) {
+                $whereClauses[] = "{$key} = :{$key}";
+                $params[$key] = $value;
+            }
+        }
+
+        $whereClause = empty($whereClauses) ? '1=1' : implode(' AND ', $whereClauses);
+
+        try {
+            $stmt = $this->pdo->prepare("SELECT COUNT(*) FROM licenses WHERE {$whereClause}");
             $stmt->execute($params);
 
-            return array_map(
-                fn($row) => License::fromRow($row),
-                $stmt->fetchAll()
-            );
+            return (int) $stmt->fetchColumn();
         } catch (PDOException $e) {
-            $context = ErrorContext::describe($e, [
-                'method' => __METHOD__,
-                'filters' => $filters,
-            ]);
+            $context = ErrorContext::describe($e, ['method' => __METHOD__]);
             Logger::error($context);
+
             throw new \RuntimeException(
-                "Failed to filter licenses: database query error. Check logs for details.",
+                'Failed to count Licenses: database error',
                 0,
                 $e
             );
@@ -342,129 +398,55 @@ final class LicenseRepository
     }
 
     /**
-     * Count licenses by status.
-     *
-     * @param string $status Status value (active, grace, expired, revoked)
-     * @return int Count of licenses with that status
+     * Count Licenses by status.
      */
     public function countByStatus(string $status): int
     {
-        try {
-            $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM licenses WHERE status = ?');
-            $stmt->execute([$status]);
-            return (int) $stmt->fetchColumn();
-        } catch (PDOException $e) {
-            $context = ErrorContext::describe($e, [
-                'method' => __METHOD__,
-                'status' => $status,
-            ]);
-            Logger::error($context);
-            throw new \RuntimeException(
-                "Failed to count licenses by status '{$status}': database query error. Check logs for details.",
-                0,
-                $e
-            );
-        }
+        return $this->countBy(['status' => $status]);
     }
 
     /**
-     * Count licenses by tier.
-     *
-     * @param string $tier Tier value (annual, lifetime)
-     * @return int Count of licenses with that tier
+     * Count Licenses by tier.
      */
     public function countByTier(string $tier): int
     {
-        try {
-            $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM licenses WHERE tier = ?');
-            $stmt->execute([$tier]);
-            return (int) $stmt->fetchColumn();
-        } catch (PDOException $e) {
-            $context = ErrorContext::describe($e, [
-                'method' => __METHOD__,
-                'tier' => $tier,
-            ]);
-            Logger::error($context);
-            throw new \RuntimeException(
-                "Failed to count licenses by tier '{$tier}': database query error. Check logs for details.",
-                0,
-                $e
-            );
-        }
-    }
-
-    /**
-     * Get licenses expiring within N days.
-     *
-     * Only considers non-expired, non-revoked annual licenses with non-null expires_at.
-     * Clamps days to 1-365 range.
-     *
-     * @param int $days Number of days (will be clamped to 1-365)
-     * @return License[] Array of expiring licenses
-     */
-    public function expiringWithin(int $days): array
-    {
-        // Clamp days to reasonable range
-        $days = max(1, min(365, $days));
-
-        try {
-            $stmt = $this->pdo->prepare(
-                'SELECT * FROM licenses 
-                 WHERE tier = ? 
-                   AND status NOT IN (?, ?)
-                   AND expires_at IS NOT NULL
-                   AND expires_at BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL ? DAY)
-                 ORDER BY expires_at ASC'
-            );
-            $stmt->execute(['annual', 'expired', 'revoked', $days]);
-
-            return array_map(
-                fn($row) => License::fromRow($row),
-                $stmt->fetchAll()
-            );
-        } catch (PDOException $e) {
-            $context = ErrorContext::describe($e, [
-                'method' => __METHOD__,
-                'days' => $days,
-            ]);
-            Logger::error($context);
-            throw new \RuntimeException(
-                "Failed to get expiring licenses: database query error. Check logs for details.",
-                0,
-                $e
-            );
-        }
+        return $this->countBy(['tier' => $tier]);
     }
 
     /**
      * Calculate Monthly Recurring Revenue (MRR).
-     *
-     * Sums price_amount for active, annual, INR, non-null-price licenses,
-     * divided by 12 (annual payment amortized monthly).
-     *
-     * Used by admin dashboard (task 20).
-     *
-     * @return float MRR in INR
+     * 
+     * MRR = Sum of price_amount for active annual INR licenses / 12
      */
     public function calculateMRR(): float
     {
         try {
             $stmt = $this->pdo->prepare(
-                'SELECT SUM(price_amount) as total FROM licenses 
-                 WHERE status = ? 
-                   AND tier = ? 
-                   AND currency = ?
+                'SELECT COALESCE(SUM(CAST(price_amount AS DECIMAL(10,2))), 0) as total
+                 FROM licenses
+                 WHERE status = :status
+                   AND tier = :tier
+                   AND currency = :currency
                    AND price_amount IS NOT NULL'
             );
-            $stmt->execute(['active', 'annual', 'INR']);
-            $total = $stmt->fetchColumn();
 
-            return $total ? (float) $total / 12.0 : 0.0;
+            $stmt->execute([
+                'status' => 'active',
+                'tier' => 'annual',
+                'currency' => 'INR',
+            ]);
+
+            $row = $stmt->fetch();
+            $totalAnnual = (float) ($row['total'] ?? 0);
+
+            // MRR is annual amount divided by 12
+            return $totalAnnual / 12;
         } catch (PDOException $e) {
             $context = ErrorContext::describe($e, ['method' => __METHOD__]);
             Logger::error($context);
+
             throw new \RuntimeException(
-                "Failed to calculate MRR: database query error. Check logs for details.",
+                'Failed to calculate MRR: database error',
                 0,
                 $e
             );
@@ -472,21 +454,111 @@ final class LicenseRepository
     }
 
     /**
-     * Get all licenses matching a combined query builder (for admin list + CSV export).
+     * Find Licenses expiring within a given number of days.
      *
-     * Supports: filters (status/tier/product AND), search (email/key substring),
-     * expiring window, pagination.
-     *
-     * This method will be expanded in tasks 21-22 for admin panel list/export features.
-     * Placeholder implementation for now.
-     *
-     * @param array<string, mixed> $params Query parameters
-     * @return License[] Array of licenses
+     * @param int $days Number of days from now
+     * @return list<License>
      */
-    public function queryForAdmin(array $params): array
+    public function expiringWithin(int $days): array
     {
-        // TODO: Implement full query builder in tasks 21-22
-        // For now, return empty array as placeholder
-        return [];
+        $days = max(1, min(365, $days)); // Clamp 1-365 days
+
+        try {
+            $stmt = $this->pdo->prepare(
+                'SELECT * FROM licenses
+                 WHERE tier = :tier
+                   AND status IN (:status_active, :status_grace)
+                   AND expires_at IS NOT NULL
+                   AND expires_at BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL :days DAY)
+                 ORDER BY expires_at ASC'
+            );
+
+            $stmt->execute([
+                'tier' => 'annual',
+                'status_active' => 'active',
+                'status_grace' => 'grace',
+                'days' => $days,
+            ]);
+
+            $rows = $stmt->fetchAll();
+            return array_map(fn($row) => License::fromRow($row), $rows);
+        } catch (PDOException $e) {
+            $context = ErrorContext::describe($e, ['method' => __METHOD__]);
+            Logger::error($context);
+
+            throw new \RuntimeException(
+                'Failed to query expiring Licenses: database error',
+                0,
+                $e
+            );
+        }
+    }
+
+    /**
+     * Find Licenses expiring within a given number of days.
+     *
+     * @param int $days Number of days from now
+     * @return list<License>
+     */
+    public function expiringWithin(int $days): array
+    {
+        $days = max(1, min(365, $days)); // Clamp 1-365 days
+
+        try {
+            $stmt = $this->pdo->prepare(
+                'SELECT * FROM licenses
+                 WHERE tier = :tier
+                   AND status IN (:status_active, :status_grace)
+                   AND expires_at IS NOT NULL
+                   AND expires_at BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL :days DAY)
+                 ORDER BY expires_at ASC'
+            );
+
+            $stmt->execute([
+                'tier' => 'annual',
+                'status_active' => 'active',
+                'status_grace' => 'grace',
+                'days' => $days,
+            ]);
+
+            $rows = $stmt->fetchAll();
+            return array_map(fn($row) => License::fromRow($row), $rows);
+        } catch (PDOException $e) {
+            $context = ErrorContext::describe($e, ['method' => __METHOD__]);
+            Logger::error($context);
+
+            throw new \RuntimeException(
+                'Failed to query expiring Licenses: database error',
+                0,
+                $e
+            );
+        }
+    }
+
+    /**
+     * Generate a unique license key that doesn't exist in the database.
+     *
+     * Retries up to 10 times to handle the unlikely collision case.
+     *
+     * @throws \RuntimeException if unable to generate a unique key after max retries.
+     */
+    private function generateUniqueLicenseKey(): string
+    {
+        $maxRetries = 10;
+        $generator = new LicenseKeyGenerator();
+
+        for ($i = 0; $i < $maxRetries; $i++) {
+            $key = $generator->generate();
+
+            // Check if key already exists
+            $existing = $this->findByKey($key);
+            if ($existing === null) {
+                return $key;
+            }
+        }
+
+        throw new \RuntimeException(
+            'Failed to generate unique license_key after ' . $maxRetries . ' attempts'
+        );
     }
 }

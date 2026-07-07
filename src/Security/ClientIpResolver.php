@@ -4,110 +4,77 @@ declare(strict_types=1);
 
 namespace App\Security;
 
-use App\Support\Logger;
-
 /**
- * ClientIpResolver - Real client IP resolution behind Cloudflare proxy.
+ * ClientIpResolver - Resolve true client IP from requests behind proxies.
  *
- * Implements the Requirement 8 decision tree for resolving the true client IP
- * from proxy headers, with security-first fail-closed behavior.
+ * Implements the Requirement 8 decision tree for IP resolution:
+ * - If REMOTE_ADDR is in trusted proxy ranges AND X-Forwarded-For is present:
+ *   Use rightmost valid IP from X-Forwarded-For
+ * - Otherwise: Use REMOTE_ADDR
  *
- * Decision logic:
- * 1. If REMOTE_ADDR is within trusted proxy ranges (Cloudflare):
- *    a. Prefer CF-Connecting-IP if present and valid
- *    b. Else use rightmost X-Forwarded-For entry if present and valid
- *    c. Else fall back to REMOTE_ADDR
- * 2. If REMOTE_ADDR is NOT within trusted ranges:
- *    - Use REMOTE_ADDR directly (ignore proxy headers to prevent spoofing)
- * 3. If trusted ranges config is empty/unparseable:
- *    - Use REMOTE_ADDR directly (fail-closed per Requirement 8.6)
+ * Validates IP format and falls back to REMOTE_ADDR on invalid header values.
  *
- * Invalid IP header fallback (Requirement 8.7): If a proxy header value is not
- * syntactically valid, fall back to REMOTE_ADDR rather than rejecting the request.
- *
- * Per Requirements 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7 and design.md ClientIpResolver section.
+ * Per Requirements 8.1-8.7 and design.md Security section.
  */
 final class ClientIpResolver
 {
     /**
-     * Resolve the real client IP from $_SERVER-style array.
+     * Resolve the client IP address.
      *
-     * @param array<string, string> $serverVars $_SERVER or equivalent (REMOTE_ADDR, HTTP_CF_CONNECTING_IP, HTTP_X_FORWARDED_FOR)
-     * @param TrustedProxyRanges $ranges Configured trusted proxy ranges
-     * @return string Resolved client IP (always valid, falls back to REMOTE_ADDR on any issue)
+     * Decision tree:
+     * 1. Check if REMOTE_ADDR is a trusted proxy
+     * 2. If yes and X-Forwarded-For exists: parse rightmost valid IP
+     * 3. If no or invalid header: use REMOTE_ADDR
+     *
+     * @param array<string, mixed> $serverVars $_SERVER superglobal
+     * @param TrustedProxyRanges $trustedRanges Configured trusted proxy ranges
+     * @return string Resolved IP address (always valid IPv4 or IPv6)
      */
-    public function resolve(array $serverVars, TrustedProxyRanges $ranges): string
+    public function resolve(array $serverVars, TrustedProxyRanges $trustedRanges): string
     {
         $remoteAddr = $serverVars['REMOTE_ADDR'] ?? '';
 
-        // Validate REMOTE_ADDR (should always be set and valid by PHP/web server)
+        // Validate REMOTE_ADDR format
         if (!$this->isValidIp($remoteAddr)) {
-            // This should never happen in normal operation, but handle gracefully
-            Logger::error("Invalid or missing REMOTE_ADDR: {$remoteAddr}. Using 0.0.0.0 as fallback.");
-            return '0.0.0.0';
+            return '0.0.0.0'; // Fallback for invalid/missing REMOTE_ADDR
         }
 
-        // Fail-closed if trusted ranges empty/unparseable (Requirement 8.6)
-        if ($ranges->isEmpty()) {
+        // Check if REMOTE_ADDR is a trusted proxy
+        if (!$trustedRanges->contains($remoteAddr)) {
+            // Not behind a trusted proxy, use REMOTE_ADDR directly
             return $remoteAddr;
         }
 
-        // If REMOTE_ADDR not in trusted ranges, use it directly (Requirement 8.3)
-        if (!$ranges->contains($remoteAddr)) {
+        // Behind trusted proxy: check X-Forwarded-For header
+        $forwardedFor = $serverVars['HTTP_X_FORWARDED_FOR'] ?? '';
+
+        if ($forwardedFor === '') {
+            // No X-Forwarded-For header, use REMOTE_ADDR
             return $remoteAddr;
         }
 
-        // REMOTE_ADDR is trusted proxy → check CF-Connecting-IP first (Requirement 8.1)
-        $cfConnectingIp = $serverVars['HTTP_CF_CONNECTING_IP'] ?? null;
-        if ($cfConnectingIp !== null && $this->isValidIp($cfConnectingIp)) {
-            return $cfConnectingIp;
-        }
+        // Parse X-Forwarded-For: take rightmost valid IP
+        $ips = array_map('trim', explode(',', $forwardedFor));
+        $ips = array_reverse($ips); // Rightmost first
 
-        // CF-Connecting-IP absent/invalid → check X-Forwarded-For rightmost (Requirement 8.2)
-        $xForwardedFor = $serverVars['HTTP_X_FORWARDED_FOR'] ?? null;
-        if ($xForwardedFor !== null) {
-            $rightmostIp = $this->extractRightmostIp($xForwardedFor);
-            if ($rightmostIp !== null && $this->isValidIp($rightmostIp)) {
-                return $rightmostIp;
+        foreach ($ips as $ip) {
+            if ($this->isValidIp($ip)) {
+                return $ip;
             }
         }
 
-        // Both proxy headers absent/invalid → fall back to REMOTE_ADDR (Requirement 8.7)
+        // All IPs in X-Forwarded-For were invalid, fall back to REMOTE_ADDR
         return $remoteAddr;
     }
 
     /**
-     * Validate that a string is a syntactically valid IP address (IPv4 or IPv6).
-     *
-     * Per Requirement 8.7: invalid IP header → fall back to REMOTE_ADDR.
+     * Validate IP address format (IPv4 or IPv6).
      *
      * @param string $ip IP address to validate
-     * @return bool True if valid IP format
+     * @return bool True if valid IPv4 or IPv6
      */
     private function isValidIp(string $ip): bool
     {
         return filter_var($ip, FILTER_VALIDATE_IP) !== false;
-    }
-
-    /**
-     * Extract the rightmost (last) IP from X-Forwarded-For header.
-     *
-     * X-Forwarded-For format: "client, proxy1, proxy2"
-     * Rightmost entry is the last proxy before our server (most trustworthy if from trusted proxy).
-     *
-     * @param string $xForwardedFor X-Forwarded-For header value
-     * @return string|null Rightmost IP, or null if header is empty
-     */
-    private function extractRightmostIp(string $xForwardedFor): ?string
-    {
-        $ips = array_map('trim', explode(',', $xForwardedFor));
-        $ips = array_filter($ips, fn($ip) => $ip !== '');
-
-        if (empty($ips)) {
-            return null;
-        }
-
-        // Return rightmost (last) IP
-        return end($ips);
     }
 }

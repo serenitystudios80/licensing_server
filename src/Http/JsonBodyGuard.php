@@ -4,187 +4,136 @@ declare(strict_types=1);
 
 namespace App\Http;
 
-use App\Support\ErrorContext;
-use App\Support\Logger;
-
 /**
- * JsonBodyGuard - Stages 1-3 of the API request pipeline.
+ * JsonBodyGuard - Stages 1-3 of request validation.
  *
- * Implements the first three validation stages per design.md Request lifecycle:
- * 1. HTTP method == POST?
- * 2. Route defined?
- * 3. Body size ≤64KB AND valid JSON?
+ * Validates incoming requests before they reach handler business logic:
+ * 1. HTTP method must be POST (Requirement 20.1)
+ * 2. Route must be defined (Requirement 20.2)
+ * 3. Body size <= 64KB and valid JSON (Requirements 20.3, 20.9)
  *
- * These checks run BEFORE rate limiting and HMAC auth (stages 4-5), so invalid
- * requests are rejected early without hitting the database or expensive crypto.
+ * Returns ErrorResponse or validated Request with parsed JSON.
  *
- * Per Requirements 20.1, 20.2, 20.3, 20.9 and design.md pipeline ordering.
+ * Per Requirements 20.1, 20.2, 20.3, 20.9 and design.md Request lifecycle.
  */
 final class JsonBodyGuard
 {
     /**
-     * Maximum allowed request body size: 64KB.
-     * Per Requirement 20.3.
+     * Maximum allowed request body size (64KB).
      */
-    private const MAX_BODY_SIZE = 65536; // 64 * 1024
+    private const MAX_BODY_SIZE = 65536; // 64KB
 
-    public function __construct(
-        private Router $router,
-    ) {
+    /**
+     * Stage 1: Validate HTTP method is POST.
+     *
+     * @param Request $request The incoming request
+     * @return Response|null Null if valid, Response if validation failed
+     */
+    public static function checkMethod(Request $request): ?Response
+    {
+        if ($request->method !== 'POST') {
+            return ErrorResponder::build(
+                'method_not_allowed',
+                'Only POST requests are allowed',
+                405
+            );
+        }
+
+        return null;
     }
 
     /**
-     * Validate stages 1-3 of the API pipeline.
-     *
-     * Returns a Response with structured error if any stage fails,
-     * or null if all stages pass (caller proceeds to stage 4).
-     *
-     * If stage 3 passes (valid JSON), the Request is updated to include
-     * the parsed JSON payload via Request::withJson().
+     * Stage 2: Validate route is defined.
      *
      * @param Request $request The incoming request
-     * @return ValidationResult Result indicating success or error response
+     * @return Response|null Null if valid, Response if validation failed
      */
-    public function validate(Request $request): ValidationResult
+    public static function checkRoute(Request $request): ?Response
     {
-        // Stage 1: HTTP method == POST?
-        if ($request->method !== 'POST') {
-            return ValidationResult::error(
-                ErrorResponder::build(
-                    'method_not_allowed',
-                    'Only POST requests are allowed on API endpoints. ' .
-                    "Received: {$request->method} {$request->path}",
-                    405
-                )
+        if (!Router::isValidRoute($request->path)) {
+            return ErrorResponder::build(
+                'not_found',
+                "Route {$request->path} not found",
+                404
             );
         }
 
-        // Stage 2: Route defined?
-        $routeMatch = $this->router->match($request->path);
-        if (!$routeMatch->found) {
-            return ValidationResult::error(
-                ErrorResponder::notFound(
-                    "Route not found: {$request->path}. Valid routes: " .
-                    implode(', ', $this->router->getRoutes()),
-                    'route_not_found'
-                )
-            );
-        }
+        return null;
+    }
 
-        // Stage 3a: Body size ≤64KB?
+    /**
+     * Stage 3: Validate body size and parse JSON.
+     *
+     * Returns either:
+     * - Error Response if body too large or invalid JSON
+     * - Validated Request with parsed JSON
+     *
+     * @param Request $request The incoming request
+     * @return Request|Response Validated Request or error Response
+     */
+    public static function checkBodyAndParseJson(Request $request): Request|Response
+    {
+        // Check body size
         $bodySize = $request->getBodySize();
         if ($bodySize > self::MAX_BODY_SIZE) {
-            // Oversized body → 413 without attempting JSON parsing
-            // (prevents DoS via huge malformed JSON payloads)
-            return ValidationResult::error(
-                ErrorResponder::payloadTooLarge(
-                    "Request body too large: {$bodySize} bytes. Maximum allowed: " .
-                    self::MAX_BODY_SIZE . " bytes (64KB). Reduce payload size."
-                )
+            return ErrorResponder::build(
+                'payload_too_large',
+                'Request body exceeds 64KB limit',
+                413
             );
         }
 
-        // Stage 3b: Valid JSON?
+        // Parse JSON
         if ($request->rawBody === '') {
-            // Empty body → malformed (API endpoints require JSON payload)
-            return ValidationResult::error(
-                ErrorResponder::badRequest(
-                    'Request body is empty. API endpoints require a JSON payload.',
-                    'malformed_body'
-                )
-            );
+            return $request->withJson([]); // Empty body = empty JSON
         }
 
         try {
             $json = json_decode($request->rawBody, true, 512, JSON_THROW_ON_ERROR);
-
+            
             if (!is_array($json)) {
-                // Top-level JSON must be an object (decoded as assoc array)
-                return ValidationResult::error(
-                    ErrorResponder::badRequest(
-                        'Request body must be a JSON object, not a primitive or array. ' .
-                        'Expected: {"license_key": "...", ...}',
-                        'malformed_body'
-                    )
+                return ErrorResponder::build(
+                    'malformed_body',
+                    'Request body must be a JSON object',
+                    400
                 );
             }
 
-            // All stages passed - attach parsed JSON to request
-            $requestWithJson = $request->withJson($json);
-            return ValidationResult::success($requestWithJson);
-
+            return $request->withJson($json);
         } catch (\JsonException $e) {
-            // Malformed JSON → 400 with specific error message
-            $context = ErrorContext::describe($e, [
-                'method' => 'JsonBodyGuard::validate',
-                'path' => $request->path,
-                'body_size' => $bodySize,
-            ]);
-            Logger::warning($context);
-
-            return ValidationResult::error(
-                ErrorResponder::badRequest(
-                    'Request body is not valid JSON. Parse error: ' . $e->getMessage() . '. ' .
-                    'Ensure the payload is properly JSON-encoded.',
-                    'malformed_body'
-                )
+            return ErrorResponder::build(
+                'malformed_body',
+                'Invalid JSON in request body',
+                400
             );
         }
     }
 
     /**
-     * Get the maximum allowed body size (for testing/documentation).
+     * Run all three validation stages.
      *
-     * @return int Maximum body size in bytes (64KB)
-     */
-    public static function getMaxBodySize(): int
-    {
-        return self::MAX_BODY_SIZE;
-    }
-}
-
-/**
- * ValidationResult value object.
- *
- * Returned by JsonBodyGuard::validate() to indicate success (with updated Request)
- * or failure (with error Response).
- */
-final readonly class ValidationResult
-{
-    private function __construct(
-        public bool $success,
-        public ?Request $request,
-        public ?Response $errorResponse,
-    ) {
-    }
-
-    /**
-     * Create a success result.
+     * Convenience method that runs all stages in order and returns either:
+     * - Error Response if any stage failed
+     * - Validated Request with parsed JSON if all stages passed
      *
-     * @param Request $request Request with parsed JSON attached
-     * @return self
+     * @param Request $request The incoming request
+     * @return Request|Response Validated Request or error Response
      */
-    public static function success(Request $request): self
+    public static function validate(Request $request): Request|Response
     {
-        return new self(
-            success: true,
-            request: $request,
-            errorResponse: null,
-        );
-    }
+        // Stage 1: Method check
+        $methodError = self::checkMethod($request);
+        if ($methodError !== null) {
+            return $methodError;
+        }
 
-    /**
-     * Create an error result.
-     *
-     * @param Response $errorResponse Structured error response
-     * @return self
-     */
-    public static function error(Response $errorResponse): self
-    {
-        return new self(
-            success: false,
-            request: null,
-            errorResponse: $errorResponse,
-        );
+        // Stage 2: Route check
+        $routeError = self::checkRoute($request);
+        if ($routeError !== null) {
+            return $routeError;
+        }
+
+        // Stage 3: Body size and JSON parsing
+        return self::checkBodyAndParseJson($request);
     }
 }

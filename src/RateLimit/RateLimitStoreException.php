@@ -5,14 +5,17 @@ declare(strict_types=1);
 namespace App\RateLimit;
 
 /**
- * RateLimitStoreException - Thrown when rate limit store read fails.
+ * RateLimitStoreException - Thrown when rate limit store operations fail.
  *
- * Distinct from write failures (which are logged and swallowed by record()).
- * Read failures (countSince()) throw this exception so the caller (RateLimiter)
- * can distinguish "0 requests" from "couldn't tell" and fail open correctly.
+ * Used by RateLimitRepository to signal read failures (write failures are
+ * caught and logged but never thrown).
  *
- * Per Requirement 2 AC3, 9 AC8 and design.md RateLimiter section.
+ * Per Requirements 2.3, 9.5 and design.md Rate limiting section.
  */
 final class RateLimitStoreException extends \RuntimeException
 {
+    public function __construct(string $message, int $code = 0, ?\Throwable $previous = null)
+    {
+        parent::__construct($message, $code, $previous);
+    }
 }

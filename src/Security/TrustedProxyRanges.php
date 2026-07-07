@@ -4,93 +4,64 @@ declare(strict_types=1);
 
 namespace App\Security;
 
-use App\Support\Logger;
-
 /**
- * TrustedProxyRanges - CIDR range parser for trusted proxy configuration.
+ * TrustedProxyRanges - Parse and check trusted proxy IP ranges.
  *
- * Parses a comma-separated list of CIDR ranges from config (Cloudflare's published ranges)
- * to determine which proxy headers (CF-Connecting-IP, X-Forwarded-For) can be trusted.
+ * Parses TRUSTED_PROXY_RANGES config (comma-separated IP addresses or CIDR ranges).
+ * Empty/unparseable input yields an empty range set (no proxies trusted).
  *
- * Empty/missing/unparseable input yields an empty range set (fail-closed: trust only REMOTE_ADDR).
- *
- * Per Requirements 8.4, 8.6 and design.md ClientIpResolver section.
+ * Per Requirements 8.2, 8.4, 8.5 and design.md Security section.
  */
 final class TrustedProxyRanges
 {
     /**
-     * @param array<array{network: string, mask: string, bits: int}> $ranges
+     * @var list<string> List of individual IPs or CIDR ranges
      */
-    private function __construct(
-        private array $ranges,
-    ) {
+    private array $ranges;
+
+    /**
+     * @param list<string> $ranges List of IP addresses or CIDR ranges
+     */
+    private function __construct(array $ranges)
+    {
+        $this->ranges = $ranges;
     }
 
     /**
      * Parse trusted proxy ranges from config string.
      *
-     * Input format: comma-separated CIDR notation (e.g., "173.245.48.0/20,103.21.244.0/22")
-     * Supports both IPv4 and IPv6 CIDR notation.
+     * Format: "10.0.0.1,192.168.1.0/24,172.16.0.0/12"
+     * Empty or unparseable input → empty range set.
      *
-     * Empty/unparseable input yields an empty range set (fail-closed behavior per Requirement 8.6).
-     *
-     * @param string $csv Comma-separated CIDR ranges
+     * @param string $csv Comma-separated IP ranges
      * @return self
      */
     public static function fromConfig(string $csv): self
     {
-        $csv = trim($csv);
-        
-        if ($csv === '') {
-            // Empty config → empty range set (fail-closed)
+        if (trim($csv) === '') {
             return new self([]);
         }
 
-        $ranges = [];
-        $parts = array_map('trim', explode(',', $csv));
+        $ranges = array_map('trim', explode(',', $csv));
+        $ranges = array_filter($ranges, fn($r) => $r !== '');
 
-        foreach ($parts as $cidr) {
-            if ($cidr === '') {
-                continue; // Skip empty entries
-            }
-
-            $parsed = self::parseCidr($cidr);
-            if ($parsed !== null) {
-                $ranges[] = $parsed;
-            } else {
-                // Unparseable CIDR → log warning and skip (continue parsing rest)
-                Logger::warning("Unparseable CIDR range in TRUSTED_PROXY_RANGES: {$cidr}. Skipping.");
-            }
-        }
-
-        return new self($ranges);
+        return new self(array_values($ranges));
     }
 
     /**
-     * Check if an IP address is within any of the trusted ranges.
+     * Check if an IP address is in the trusted ranges.
      *
-     * @param string $ip IP address to check (IPv4 or IPv6)
-     * @return bool True if IP is within a trusted range
+     * @param string $ip IP address to check
+     * @return bool True if IP is in any trusted range
      */
     public function contains(string $ip): bool
     {
-        $ipLong = @inet_pton($ip);
-        if ($ipLong === false) {
-            // Invalid IP format → not trusted
-            return false;
+        if (empty($this->ranges)) {
+            return false; // No trusted proxies configured
         }
 
         foreach ($this->ranges as $range) {
-            $networkLong = @inet_pton($range['network']);
-            $maskLong = @inet_pton($range['mask']);
-
-            if ($networkLong === false || $maskLong === false) {
-                // Range parse failure (shouldn't happen if parsed correctly in fromConfig)
-                continue;
-            }
-
-            // Bitwise AND to check if IP is in network
-            if (($ipLong & $maskLong) === ($networkLong & $maskLong)) {
+            if ($this->ipMatchesRange($ip, $range)) {
                 return true;
             }
         }
@@ -99,89 +70,57 @@ final class TrustedProxyRanges
     }
 
     /**
-     * Check if the range set is empty (fail-closed mode).
+     * Check if an IP matches a range (single IP or CIDR).
      *
-     * @return bool True if no trusted ranges configured
+     * @param string $ip IP to check
+     * @param string $range IP or CIDR range (e.g., "192.168.1.0/24")
+     * @return bool True if IP is in range
+     */
+    private function ipMatchesRange(string $ip, string $range): bool
+    {
+        // Simple single IP comparison
+        if (!str_contains($range, '/')) {
+            return $ip === $range;
+        }
+
+        // CIDR range comparison
+        [$subnet, $mask] = explode('/', $range, 2);
+        $mask = (int) $mask;
+
+        // Convert IPs to binary for comparison
+        $ipBin = inet_pton($ip);
+        $subnetBin = inet_pton($subnet);
+
+        if ($ipBin === false || $subnetBin === false) {
+            return false; // Invalid IP format
+        }
+
+        // IPv4 or IPv6 handling
+        $bitsToCompare = $mask;
+        $bytesToCompare = (int) ceil($bitsToCompare / 8);
+
+        for ($i = 0; $i < $bytesToCompare; $i++) {
+            $ipByte = ord($ipBin[$i] ?? "\x00");
+            $subnetByte = ord($subnetBin[$i] ?? "\x00");
+
+            $bitsInThisByte = min(8, $bitsToCompare - ($i * 8));
+            $maskByte = ~((1 << (8 - $bitsInThisByte)) - 1) & 0xFF;
+
+            if (($ipByte & $maskByte) !== ($subnetByte & $maskByte)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Check if any trusted proxies are configured.
+     *
+     * @return bool True if at least one range is configured
      */
     public function isEmpty(): bool
     {
         return empty($this->ranges);
-    }
-
-    /**
-     * Parse a CIDR notation string into network, mask, and bits.
-     *
-     * @param string $cidr CIDR notation (e.g., "173.245.48.0/20")
-     * @return array{network: string, mask: string, bits: int}|null Parsed range or null if invalid
-     */
-    private static function parseCidr(string $cidr): ?array
-    {
-        if (!str_contains($cidr, '/')) {
-            // Missing slash → invalid CIDR
-            return null;
-        }
-
-        [$network, $bitsStr] = explode('/', $cidr, 2);
-        $network = trim($network);
-        $bitsStr = trim($bitsStr);
-
-        if (!ctype_digit($bitsStr)) {
-            // Non-numeric bits → invalid
-            return null;
-        }
-
-        $bits = (int) $bitsStr;
-
-        // Validate IP format
-        $networkBinary = @inet_pton($network);
-        if ($networkBinary === false) {
-            // Invalid IP format
-            return null;
-        }
-
-        $isIPv6 = str_contains($network, ':');
-        $maxBits = $isIPv6 ? 128 : 32;
-
-        if ($bits < 0 || $bits > $maxBits) {
-            // Bits out of range
-            return null;
-        }
-
-        // Compute netmask
-        if ($isIPv6) {
-            // IPv6: 128-bit mask
-            $mask = str_repeat('f', $bits / 4);
-            if ($bits % 4 !== 0) {
-                $mask .= dechex(0xf << (4 - ($bits % 4)) & 0xf);
-            }
-            $mask = str_pad($mask, 32, '0');
-            $mask = pack('H*', $mask);
-        } else {
-            // IPv4: 32-bit mask
-            $mask = $bits === 0 ? 0 : (~0 << (32 - $bits));
-            $mask = pack('N', $mask);
-        }
-
-        $maskStr = inet_ntop($mask);
-        if ($maskStr === false) {
-            // Mask conversion failed
-            return null;
-        }
-
-        return [
-            'network' => $network,
-            'mask' => $maskStr,
-            'bits' => $bits,
-        ];
-    }
-
-    /**
-     * Get the count of trusted ranges (for testing/debugging).
-     *
-     * @return int Number of trusted ranges
-     */
-    public function count(): int
-    {
-        return count($this->ranges);
     }
 }

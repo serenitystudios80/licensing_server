@@ -6,7 +6,6 @@ namespace App\Api;
 
 use App\Config\Config;
 use App\Domain\LicenseKeyGenerator;
-use App\Http\Request;
 use App\Http\Response;
 use App\Http\ErrorResponder;
 use App\Repository\LicenseRepository;
@@ -17,21 +16,21 @@ use App\Support\ErrorContext;
 use App\Support\Logger;
 
 /**
- * ActivateHandler - /activate endpoint logic (stages 6-8).
+ * ActivateHandler - POST /activate endpoint.
  *
- * Implements the fixed sub-order from Requirement 4 AC11:
- * 1. Missing required field (license_key or site_url)
- * 2. license_key format validation
- * 3. Unknown license_key (database lookup)
- * 4. License status revoked/expired
- * 5. Activation limit exceeded
+ * Implements stages 6-8 for /activate:
+ * - Stage 6: Required fields (license_key, site_url)
+ * - Stage 7: Field format validation
+ * - Stage 8: Business rules (license status, activation limit, dedup/reactivation)
  *
- * Then performs activation logic:
- * - Idempotent dedup: existing active site_hash → update last_validated_at, return current status
- * - Reactivation: existing deactivated site_hash → clear deactivated_at, update timestamps
- * - New activation: create new activation row, append event
+ * Fixed sub-order per Requirement 4 AC11:
+ * 1. Unknown license → license_not_found
+ * 2. Revoked status → license_revoked
+ * 3. Expired status → license_expired
+ * 4. Activation limit check
+ * 5. Dedup/reactivation logic
  *
- * Per Requirements 4.1-4.11 and design.md ActivateHandler section.
+ * Per Requirements 4.1-4.11 and design.md /activate section.
  */
 final class ActivateHandler
 {
@@ -41,10 +40,8 @@ final class ActivateHandler
     private LicenseKeyGenerator $keyGenerator;
     private Clock $clock;
 
-    public function __construct(
-        Config $config,
-        Clock $clock,
-    ) {
+    public function __construct(Config $config, Clock $clock)
+    {
         $this->licenseRepo = new LicenseRepository($config);
         $this->activationRepo = new ActivationRepository($config);
         $this->eventRepo = new LicenseEventRepository($config);
@@ -53,165 +50,154 @@ final class ActivateHandler
     }
 
     /**
-     * Handle /activate request (stages 6-8).
+     * Handle the activation request.
      *
-     * @param Request $request Request with parsed JSON body
-     * @return Response Success or error response
+     * @param array<string, mixed> $payload The validated JSON payload
+     * @return Response
      */
-    public function handle(Request $request): Response
+    public function handle(array $payload): Response
     {
-        // Stage 6: Required fields present?
-        // Per Requirement 4 AC4, AC11 (sub-order #1)
-        if (!isset($request->json[FieldNames::LICENSE_KEY])) {
-            return ErrorResponder::badRequest(
-                'Missing required field: ' . FieldNames::LICENSE_KEY . '. ' .
-                'The /activate endpoint requires both license_key and site_url.'
-            );
+        // Stage 6: Required field validation
+        $licenseKey = $payload[FieldNames::LICENSE_KEY] ?? null;
+        $siteUrl = $payload[FieldNames::SITE_URL] ?? null;
+
+        if ($licenseKey === null || $licenseKey === '') {
+            return ErrorResponder::badRequest('missing_license_key', 'Missing required field: license_key');
         }
 
-        if (!isset($request->json[FieldNames::SITE_URL])) {
-            return ErrorResponder::badRequest(
-                'Missing required field: ' . FieldNames::SITE_URL . '. ' .
-                'The /activate endpoint requires both license_key and site_url.'
-            );
+        if ($siteUrl === null || $siteUrl === '') {
+            return ErrorResponder::badRequest('missing_site_url', 'Missing required field: site_url');
         }
-
-        $licenseKey = (string) $request->json[FieldNames::LICENSE_KEY];
-        $siteUrl = (string) $request->json[FieldNames::SITE_URL];
 
         // Stage 7: Field format validation
-        // Per Requirement 4 AC3, AC11 (sub-order #2)
         if (!$this->keyGenerator->isValidFormat($licenseKey)) {
             return ErrorResponder::badRequest(
-                'Invalid license_key format: must match SERB-XXXXX-XXXXX-XXXXX-XXXXX pattern. ' .
-                "Received: {$licenseKey}",
-                'invalid_license_key_format'
+                'invalid_license_key_format',
+                'Invalid license_key format. Expected: SERB-XXXXX-XXXXX-XXXXX-XXXXX'
             );
         }
 
-        // Compute site_hash from site_url (SHA-256)
-        // Per Requirement 4 AC1
-        $siteHash = hash('sha256', $siteUrl);
+        if (!filter_var($siteUrl, FILTER_VALIDATE_URL)) {
+            return ErrorResponder::badRequest('invalid_site_url', 'Invalid site_url format');
+        }
 
         // Stage 8: Business rules
-        try {
-            return $this->processActivation($licenseKey, $siteUrl, $siteHash);
-        } catch (\Throwable $e) {
-            $context = ErrorContext::describe($e, [
-                'method' => __METHOD__,
-                'license_key' => $licenseKey,
-                'site_url' => $siteUrl,
-            ]);
-            Logger::error($context);
-
-            return ErrorResponder::internalError(
-                'Failed to process activation request: an unexpected error occurred. ' .
-                'Please try again or contact support.',
-                'activation_failed'
-            );
-        }
+        return $this->executeBusinessLogic($licenseKey, $siteUrl);
     }
 
     /**
-     * Process activation business logic (stage 8).
+     * Execute business rules for activation.
      *
-     * Implements the fixed sub-order from Requirement 4 AC11.
-     *
-     * @param string $licenseKey License key
-     * @param string $siteUrl Site URL (human-readable)
-     * @param string $siteHash Site hash (SHA-256 of site_url)
-     * @return Response Success or error response
+     * Fixed order per Requirement 4 AC11.
      */
-    private function processActivation(string $licenseKey, string $siteUrl, string $siteHash): Response
+    private function executeBusinessLogic(string $licenseKey, string $siteUrl): Response
     {
-        // Sub-order #3: Unknown license_key check
-        // Per Requirement 4 AC2, AC11
-        $license = $this->licenseRepo->findByKey($licenseKey);
+        try {
+            // 1. Find license
+            $license = $this->licenseRepo->findByKey($licenseKey);
 
-        if ($license === null) {
-            return ErrorResponder::notFound(
-                "Unknown license key: {$licenseKey}. No license found with this key. " .
-                "Please check the key and try again.",
-                'unknown_license'
-            );
-        }
+            if ($license === null) {
+                return ErrorResponder::notFound('license_not_found', 'License key not found');
+            }
 
-        // Sub-order #4: License status revoked/expired check
-        // Per Requirement 4 AC9, AC11
-        if ($license->status === 'revoked') {
-            return ErrorResponder::badRequest(
-                "License {$licenseKey} has been revoked and cannot be activated. " .
-                "Contact support if you believe this is an error.",
-                'license_revoked'
-            );
-        }
+            // 2. Check revoked status
+            if ($license->status === 'revoked') {
+                return ErrorResponder::forbidden('license_revoked', 'This license has been revoked');
+            }
 
-        if ($license->status === 'expired') {
-            return ErrorResponder::badRequest(
-                "License {$licenseKey} has expired and cannot be activated. " .
-                "Please renew your license to continue using Pro features.",
-                'license_expired'
-            );
-        }
+            // 3. Check expired status
+            if ($license->status === 'expired') {
+                return ErrorResponder::forbidden('license_expired', 'This license has expired');
+            }
 
-        // Check for existing activation (active or deactivated)
-        $existingActivation = $this->activationRepo->findAnyByHash($license->id, $siteHash);
+            // 4. Generate site_hash
+            $siteHash = hash('sha256', strtolower(trim($siteUrl)));
 
-        // Idempotent dedup: existing active activation
-        // Per Requirement 4 AC5
-        if ($existingActivation !== null && $existingActivation->deactivatedAt === null) {
-            // Already activated - update last_validated_at and return current status
-            $now = date('Y-m-d H:i:s', $this->clock->now());
-            $this->activationRepo->updateLastValidated($existingActivation->id, $now);
+            // 5. Check for existing activation (dedup/mismatch/reactivation)
+            $existingActivation = $this->activationRepo->findAnyByHash($siteHash);
+
+            if ($existingActivation !== null) {
+                // Dedup: Same site already activated with same license
+                if ($existingActivation->licenseId === $license->id) {
+                    if ($existingActivation->deactivatedAt === null) {
+                        // Already activated and not deactivated - return existing activation
+                        return Response::json([
+                            'success' => true,
+                            'activation_id' => $existingActivation->id,
+                            'status' => $license->status,
+                            'expires_at' => $license->expiresAt,
+                            'message' => 'Site is already activated with this license',
+                        ]);
+                    } else {
+                        // Previously deactivated - reactivate it
+                        $now = gmdate('Y-m-d H:i:s', $this->clock->now());
+                        $this->activationRepo->reactivate($existingActivation->id, $now);
+
+                        // Log reactivation event
+                        $this->eventRepo->append($license->id, 'reactivation', [
+                            'site_url' => $siteUrl,
+                            'site_hash' => $siteHash,
+                            'activation_id' => $existingActivation->id,
+                        ]);
+
+                        return Response::json([
+                            'success' => true,
+                            'activation_id' => $existingActivation->id,
+                            'status' => $license->status,
+                            'expires_at' => $license->expiresAt,
+                            'message' => 'Site has been reactivated',
+                        ]);
+                    }
+                } else {
+                    // Mismatch: Same site trying to activate with different license
+                    return ErrorResponder::forbidden(
+                        'site_already_activated',
+                        'This site is already activated with a different license'
+                    );
+                }
+            }
+
+            // 6. Check activation limit
+            $activeCount = $this->activationRepo->countActiveForLicense($license->id);
+
+            if ($activeCount >= $license->activationLimit) {
+                return ErrorResponder::forbidden(
+                    'activation_limit_reached',
+                    "Activation limit reached ({$license->activationLimit} sites max). Please deactivate a site first."
+                );
+            }
+
+            // 7. Create new activation
+            $now = gmdate('Y-m-d H:i:s', $this->clock->now());
+            $activation = $this->activationRepo->create([
+                'license_id' => $license->id,
+                'site_url' => $siteUrl,
+                'site_hash' => $siteHash,
+                'activated_at' => $now,
+                'last_validated_at' => $now,
+            ]);
+
+            // Log activation event
+            $this->eventRepo->append($license->id, 'activation', [
+                'site_url' => $siteUrl,
+                'site_hash' => $siteHash,
+                'activation_id' => $activation->id,
+            ]);
 
             return Response::json([
-                FieldNames::STATUS => $license->status,
-                FieldNames::EXPIRES_AT => $license->expiresAt,
+                'success' => true,
+                'activation_id' => $activation->id,
+                'status' => $license->status,
+                'expires_at' => $license->expiresAt,
             ]);
+        } catch (\RuntimeException $e) {
+            $context = ErrorContext::describe($e, [
+                'method' => __METHOD__,
+                'license_key' => $licenseKey,
+            ]);
+            Logger::error($context);
+
+            return ErrorResponder::internalError('Failed to activate license');
         }
-
-        // Sub-order #5: Activation limit exceeded check
-        // Per Requirement 4 AC6, AC11
-        // Only check if this is a NEW activation (not reactivation)
-        $activeCount = $this->activationRepo->countActiveForLicense($license->id);
-
-        if ($activeCount >= $license->activationLimit) {
-            return ErrorResponder::badRequest(
-                "Activation limit exceeded for license {$licenseKey}. " .
-                "You have {$activeCount} active site(s) and your limit is {$license->activationLimit}. " .
-                "Please deactivate an existing site before activating a new one.",
-                'activation_limit_exceeded'
-            );
-        }
-
-        // Perform activation: reactivation or new activation
-        $now = date('Y-m-d H:i:s', $this->clock->now());
-
-        if ($existingActivation !== null && $existingActivation->deactivatedAt !== null) {
-            // Reactivation: existing deactivated activation
-            // Per Requirement 4 AC10
-            $activation = $this->activationRepo->reactivate($existingActivation->id, $now, $now);
-        } else {
-            // New activation: no existing activation for this site_hash
-            // Per Requirement 4 AC7
-            $activation = $this->activationRepo->create($license->id, $siteUrl, $siteHash, $now, $now);
-        }
-
-        // Append activation event
-        // Per Requirement 4 AC7
-        $this->eventRepo->append($license->id, 'activation', [
-            'activation_id' => $activation->id,
-            'site_url' => $siteUrl,
-            'site_hash' => $siteHash,
-            'activated_at' => $now,
-            'context' => $existingActivation !== null ? 'reactivation' : 'new_activation',
-        ]);
-
-        // Return success response with current status and expiry
-        // Per Requirement 4 AC8
-        return Response::json([
-            FieldNames::STATUS => $license->status,
-            FieldNames::EXPIRES_AT => $license->expiresAt,
-        ]);
     }
 }

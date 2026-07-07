@@ -5,83 +5,35 @@ declare(strict_types=1);
 namespace App\Api;
 
 /**
- * API Field Names - Provisional JSON field name constants.
+ * FieldNames - API request field name constants.
  *
- * Per design.md: These field names are PROVISIONAL and must be cross-checked
- * against the existing WordPress client scaffold (class-serb-license.php,
- * serenity-license-manager wrapper plugin) before being treated as final/frozen.
+ * Centralized constants for all API endpoint field names to avoid typos and
+ * ensure consistency across handlers.
  *
- * Isolating all field-name literals in one place means renaming them later
- * (once the real client is checked) is a one-file change rather than scattered
- * find-and-replace.
- *
- * Per design.md Provisional API field names section.
+ * Per design.md API handlers section.
  */
 final class FieldNames
 {
-    // ========================================================================
-    // Request Fields (Client → Server)
-    // ========================================================================
-
-    /**
-     * License key (all endpoints except webhook).
-     * Format: SERB-XXXXX-XXXXX-XXXXX-XXXXX
-     */
+    // Common fields
     public const LICENSE_KEY = 'license_key';
-
-    /**
-     * Site URL (human-readable, used by /activate).
-     * Example: "https://example.com"
-     */
     public const SITE_URL = 'site_url';
 
-    /**
-     * Site hash (SHA-256, used by /validate and /deactivate).
-     * 64-character lowercase hexadecimal digest.
-     */
-    public const SITE_HASH = 'site_hash';
+    // Activate endpoint
+    public const ACTIVATE_LICENSE_KEY = self::LICENSE_KEY;
+    public const ACTIVATE_SITE_URL = self::SITE_URL;
 
-    // ========================================================================
-    // Response Fields (Server → Client)
-    // ========================================================================
+    // Validate endpoint
+    public const VALIDATE_LICENSE_KEY = self::LICENSE_KEY;
+    public const VALIDATE_SITE_HASH = 'site_hash';
 
-    /**
-     * License status in response.
-     * Values: 'active', 'grace', 'expired', 'revoked'
-     */
-    public const STATUS = 'status';
+    // Deactivate endpoint
+    public const DEACTIVATE_LICENSE_KEY = self::LICENSE_KEY;
+    public const DEACTIVATE_SITE_HASH = 'site_hash';
 
-    /**
-     * License expiry timestamp in response.
-     * ISO 8601 datetime string or null for lifetime licenses.
-     */
-    public const EXPIRES_AT = 'expires_at';
-
-    /**
-     * Number of available activation slots (returned by /deactivate).
-     * Computed as: activation_limit - count(non-deactivated activations)
-     */
-    public const SLOTS_AVAILABLE = 'slots_available';
-
-    /**
-     * Webhook processing result (returned by /webhook/razorpay).
-     * Boolean: true on success
-     */
-    public const OK = 'ok';
-
-    // ========================================================================
-    // Error Response Fields (Uniform across all endpoints)
-    // ========================================================================
-
-    /**
-     * Error code in structured error responses.
-     * Examples: 'validation_error', 'unknown_license', 'rate_limited', etc.
-     */
-    public const ERROR_CODE = 'error_code';
-
-    /**
-     * Human-readable error message in structured error responses.
-     * Always specific and developer-friendly per error-handling policy.
-     */
-    public const MESSAGE = 'message';
+    // Response fields
+    public const RESPONSE_SUCCESS = 'success';
+    public const RESPONSE_STATUS = 'status';
+    public const RESPONSE_EXPIRES_AT = 'expires_at';
+    public const RESPONSE_ACTIVATION_ID = 'activation_id';
+    public const RESPONSE_SLOTS_AVAILABLE = 'slots_available';
 }

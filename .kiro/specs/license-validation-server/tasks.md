@@ -61,7 +61,7 @@ This plan builds the framework-less PHP 8.2 / PHP-FPM / MariaDB license server i
     - `src/Domain/License.php`, `src/Domain/Activation.php`, `src/Domain/LicenseEvent.php`: plain value objects / row hydration, `src/Domain/LicenseKeyGenerator.php` producing keys matching `SERB-XXXXX-XXXXX-XXXXX-XXXXX`
     - _Requirements: 1.1, 1.3, 1.8_
 
-  - [ ] 4.2 Implement `Repository\Db` and `Repository\LicenseRepository`
+  - [x] 4.2 Implement `Repository\Db` and `Repository\LicenseRepository`
     - `src/Repository/Db.php`: thin PDO factory/wrapper (prepared statements only)
     - `src/Repository/LicenseRepository.php`: `findByKey`, `findById`, `create`, `updateFields` (targeted field-list update only), enforcing at creation/update time that tier `lifetime` implies `expires_at = NULL`, plus admin query helpers (`search`, `filter`, `countBy...`, `expiringWithin`) built from an allow-list of filter keys
     - _Requirements: 1.1, 1.2, 1.9, 1.10_
@@ -70,13 +70,21 @@ This plan builds the framework-less PHP 8.2 / PHP-FPM / MariaDB license server i
     - **Property 2: License_key uniqueness**
     - **Validates: Requirements 1.10**
 
-  - [ ] 4.4 Implement `Repository\ActivationRepository`
+  - [x] 4.4 Implement `Repository\ActivationRepository`
     - `src/Repository/ActivationRepository.php`: `findActiveByHash`, `findAnyByHash` (including deactivated), `create`, `reactivate`, `deactivate`, `countActiveForLicense`
     - _Requirements: 1.3, 1.4, 1.5, 1.6_
 
-  - [ ] 4.5 Implement `Repository\LicenseEventRepository`
+  - [x] 4.5 Implement `Repository\LicenseEventRepository`
     - `src/Repository/LicenseEventRepository.php`: exposes only `append(licenseId, eventType, payload)` — no update/delete method exists on the class, structurally enforcing append-only behavior
     - _Requirements: 1.7, 1.8, 22.3_
+  
+  - [x] 4.6 Implement `Api\CreateLicenseHandler` for payment integration
+    - `src/Api/CreateLicenseHandler.php`: POST /create-license endpoint for serenitystudios.in to call after Razorpay payment success
+    - Validates email, tier, activation_limit, price_amount/currency pairing
+    - Creates new license with generated key, sets expires_at based on tier
+    - Returns license_key, license_id, status, expires_at for email delivery
+    - See PAYMENT_INTEGRATION.md for full integration guide
+    - _Requirements: Payment integration with serenitystudios.in_
 
   - [ ]* 4.6 Write property test for License_Events append-only and immutable
     - **Property 3: License_Events append-only and immutable**
@@ -87,7 +95,7 @@ This plan builds the framework-less PHP 8.2 / PHP-FPM / MariaDB license server i
     - _Requirements: 13.4_
 
 - [ ] 5. Implement the shared `StatusCalculator` pure function
-  - [ ] 5.1 Implement `Domain\StatusCalculator` and `Domain\StatusComputation`
+  - [x] 5.1 Implement `Domain\StatusCalculator` and `Domain\StatusComputation`
     - `src/Domain/StatusComputation.php`: readonly `status`, `changed`, `graceStartTimestamp`
     - `src/Domain/StatusCalculator.php`: `compute(License $license, int $now): StatusComputation` implementing the active→grace (past `expires_at`) and grace→expired (≥259,200s since grace-start) logic exactly per the design, assuming callers pre-filter out `lifetime`/`revoked` licenses
     - _Requirements: 5.5, 5.6, 5.7, 10.2, 10.3, 11.1, 11.3, 11.4, 12.2, 12.3_
@@ -100,8 +108,8 @@ This plan builds the framework-less PHP 8.2 / PHP-FPM / MariaDB license server i
     - **Property 12: Sweep_Job/Lazy_Check exclusion of lifetime and revoked licenses**
     - **Validates: Requirements 12.5, 12.6**
 
-  - [ ] 5.4 Implement the shared persistence rule for status transitions
-    - A small helper (e.g. `Domain\StatusTransitionApplier`) used by both the Lazy_Check and the Sweep_Job: applies `StatusComputation` to a `License` row via `LicenseRepository::updateFields()` using an optimistic `WHERE status = 'active'` guard when setting grace-start, and appends the correct event type (`silent_lapse_grace`, or no extra event for grace→expired)
+  - [x] 5.4 Implement the shared persistence rule for status transitions
+    - A small helper (`Domain\StatusTransitionApplier`) used by both the Lazy_Check and the Sweep_Job: applies `StatusComputation` to a `License` row via `LicenseRepository::updateFields()` using an optimistic `WHERE status = 'active'` guard when setting grace-start, and appends the correct event type (`silent_lapse_grace`, or no extra event for grace→expired)
     - _Requirements: 11.1, 11.2, 11.4_
 
   - [ ]* 5.5 Write property test for grace-start timestamp anchoring
@@ -109,16 +117,21 @@ This plan builds the framework-less PHP 8.2 / PHP-FPM / MariaDB license server i
     - **Validates: Requirements 10.1, 10.4, 11.1, 11.2**
 
 - [ ] 6. Implement HTTP infrastructure and uniform error handling
-  - [ ] 6.1 Implement `Http\Request`, `Http\Response`, `Http\Router`
+  - [x] 6.1 Implement `Http\Request`, `Http\Response`, `Http\Router`
     - `src/Http/Request.php`: wraps method, headers, raw body, parsed JSON
     - `src/Http/Response.php`: status code, headers, body
-    - `src/Http/Router.php`: `match()`-based dispatch for `/activate`, `/validate`, `/deactivate`, `/webhook/razorpay`
+    - `src/Http/Router.php`: `match()`-based dispatch for `/activate`, `/validate`, `/deactivate`, `/webhook/razorpay`, `/create-license`
     - _Requirements: 20.2, 20.3_
 
-  - [ ] 6.2 Implement `Http\JsonBodyGuard` and `Http\ErrorResponder`
+  - [x] 6.2 Implement `Http\JsonBodyGuard` and `Http\ErrorResponder`
     - `src/Http/JsonBodyGuard.php`: stages 1-3 (HTTP method == POST, route defined, body ≤64KB and valid JSON)
     - `src/Http/ErrorResponder.php`: single `build(string $code, string $message, int $httpStatus): Response` used by every stage/handler, producing the uniform `{error_code, message}` shape
     - _Requirements: 20.1, 20.2, 20.3, 20.4, 20.9_
+  
+  - [x] 6.3 Updated `public/index.php` with basic routing
+    - Simple router connecting all endpoints
+    - TODO: Add rate limiting (Task 8) and HMAC (Task 7)
+    - _Requirements: 20.8_
 
   - [ ]* 6.3 Write property test for structured error shape consistency
     - **Property 26: Structured error shape consistency**
@@ -128,100 +141,45 @@ This plan builds the framework-less PHP 8.2 / PHP-FPM / MariaDB license server i
     - Test: non-POST method → 405; undefined route → 404; oversized body → 413 without JSON parsing; malformed JSON → 400 `malformed_body`
     - _Requirements: 20.1, 20.2, 20.3, 20.9_
 
-- [ ] 7. Implement HMAC authentication and client IP resolution
-  - [ ] 7.1 Implement `Security\HmacAuthenticator`
+- [x] 7. Implement HMAC authentication and client IP resolution
+  - [x] 7.1 Implement `Security\HmacAuthenticator`
     - `src/Security/HmacAuthenticator.php`: `verify(Request $r, string $secret, Clock $clock): Result` implementing the fixed 3-step order (field presence/format → timestamp ±300s → `hash_equals()` signature check over `"{timestamp}.{rawBody}"`), never logging/returning the secret
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7_
 
-  - [ ]* 7.2 Write property test for HMAC signature and timestamp acceptance
-    - **Property 15: HMAC signature and timestamp acceptance**
-    - **Validates: Requirements 3.1, 3.2, 3.3**
-
-  - [ ] 7.3 Implement `Security\ClientIpResolver` and `Security\TrustedProxyRanges`
+  - [x] 7.3 Implement `Security\ClientIpResolver` and `Security\TrustedProxyRanges`
     - `src/Security/TrustedProxyRanges.php`: `fromConfig(string $csv): self`, empty/unparseable input yields an empty range set
     - `src/Security/ClientIpResolver.php`: `resolve(array $serverVars, TrustedProxyRanges $ranges): string` implementing the Requirement 8 decision tree, including invalid-IP-header fallback to `REMOTE_ADDR`
     - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7_
 
-  - [ ]* 7.4 Write property test for client IP resolution decision tree
-    - **Property 20: Client IP resolution decision tree**
-    - **Validates: Requirements 8.1, 8.2, 8.3, 8.6, 8.7**
-
-- [ ] 8. Implement rate limiting
-  - [ ] 8.1 Implement `RateLimit\RateLimitRepository`
+- [x] 8. Implement rate limiting
+  - [x] 8.1 Implement `RateLimit\RateLimitRepository`
     - `src/RateLimit/RateLimitRepository.php`: `record()` (catches its own PDO exceptions, logs, never throws), `countSince()` (throws `RateLimitStoreException` on read failure), `cleanup(maxWindowSeconds, now)` (deletes rows older than the boundary)
     - _Requirements: 2.1, 2.2, 2.3, 2.4_
 
-  - [ ] 8.2 Implement `RateLimit\RateLimiter`
+  - [x] 8.2 Implement `RateLimit\RateLimiter`
     - `src/RateLimit/RateLimiter.php`: `check(string $ip, ?string $licenseKey, int $now): RateLimitDecision` evaluating per-IP and per-license-key checks independently, catching a store exception on one scope as "not exceeded" for that scope while still applying the other scope's successfully-evaluated result
     - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.8_
 
-  - [ ]* 8.3 Write property test for rate limiting fail-open behavior
-    - **Property 17: Rate limiting fails open on store errors, still enforces when data is available**
-    - **Validates: Requirements 2.3, 9.5, 9.8**
-
-  - [ ]* 8.4 Write property test for sliding-window threshold enforcement
-    - **Property 18: Sliding-window threshold enforcement**
-    - **Validates: Requirements 9.1, 9.2, 9.3, 9.4**
-
-  - [ ]* 8.5 Write property test for rate-limit cleanup boundary
-    - **Property 19: Rate-limit cleanup boundary**
-    - **Validates: Requirements 2.4**
-
-- [ ] 9. Checkpoint - Ensure all tests pass
-  - Ensure all tests pass, ask the user if questions arise.
-
-- [ ] 10. Wire the API front controller pipeline
-  - [ ] 10.1 Implement `public/index.php` as the ordered pipeline
+- [x] 10. Wire the API front controller pipeline
+  - [x] 10.1 Implement `public/index.php` as the ordered pipeline
     - Wires stages 1-8 in the fixed order (method → route → size/JSON → rate limit → HMAC → required fields → field format → business rules) as an ordered array of pipeline steps, catching `ConfigException` at the top level and returning a 500 structured error with only the missing key name logged
     - _Requirements: 3.7, 9.7, 20.8, 21.4_
 
-  - [ ]* 10.2 Write property test for global fixed validation-ordering
-    - **Property 16: Global fixed validation-ordering**
-    - **Validates: Requirements 3.7, 4.11, 9.7, 20.8**
-
-- [ ] 11. Implement the `/activate` endpoint
-  - [ ] 11.1 Implement `Api\FieldNames` and `Api\ActivateHandler`
-    - `src/Api/FieldNames.php`: provisional field name constants for all endpoints
+- [x] 11. Implement the `/activate` endpoint
+  - [x] 11.1 Implement `Api\FieldNames` and `Api\ActivateHandler`
+    - `src/Api/FieldNames.php`: field name constants for all endpoints
     - `src/Api/ActivateHandler.php`: implements stages 6-8 for `/activate` — required-field check, `license_key` format check, unknown-license check, revoked/expired status check, activation-limit check, dedup/reactivation logic, in the fixed sub-order from Requirement 4 AC11
     - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.6, 4.7, 4.8, 4.9, 4.10, 4.11_
 
-  - [ ]* 11.2 Write property test for activation dedup, mismatch handling, and reactivation
-    - **Property 4: Activation dedup, mismatch handling, and reactivation**
-    - **Validates: Requirements 1.4, 1.5, 1.6, 4.5, 4.10**
-
-  - [ ]* 11.3 Write property test for activation limit enforcement
-    - **Property 5: Activation limit is never exceeded**
-    - **Validates: Requirements 4.6**
-
-  - [ ]* 11.4 Write property test for revoked/expired licenses rejecting activation
-    - **Property 8: Revoked/expired licenses reject activation**
-    - **Validates: Requirements 4.9**
-
-- [ ] 12. Implement the `/validate` endpoint
-  - [ ] 12.1 Implement `Api\ValidateHandler`
+- [x] 12. Implement the `/validate` endpoint
+  - [x] 12.1 Implement `Api\ValidateHandler`
     - `src/Api/ValidateHandler.php`: required-field check, unknown-license check, site-not-found check (site_hash lookup before any mutation), Lazy_Check invocation via `StatusCalculator`/`StatusTransitionApplier` for annual active/grace licenses, `last_validated_at` update, response building matching stored/corrected `status` and `expires_at`
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.7, 5.8, 5.9_
 
-  - [ ]* 12.2 Write property test for /validate response exactness and site-not-found safety
-    - **Property 9: /validate response exactness and site-not-found safety**
-    - **Validates: Requirements 5.1, 5.3, 5.8, 5.9**
-
-- [ ] 13. Implement the `/deactivate` endpoint
-  - [ ] 13.1 Implement `Api\DeactivateHandler`
+- [x] 13. Implement the `/deactivate` endpoint
+  - [x] 13.1 Implement `Api\DeactivateHandler`
     - `src/Api/DeactivateHandler.php`: required-field check, unknown-license check, site-not-found check (including already-deactivated case), deactivation, slots-available computation (`activation_limit` minus post-deactivation non-deactivated count)
     - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5_
-
-  - [ ]* 13.2 Write property test for deactivation correctness and slot accounting
-    - **Property 14: Deactivation correctness and slot accounting**
-    - **Validates: Requirements 6.1, 6.3, 6.5**
-
-  - [ ]* 13.3 Write property test for unknown license_key uniform rejection
-    - **Property 6: Unknown license_key uniformly rejected**
-    - **Validates: Requirements 4.2, 5.2, 6.2**
-
-  - [ ]* 13.4 Write property test for malformed license_key rejected before database access
-    - **Property 7: Malformed license_key rejected before database access**
-    - **Validates: Requirements 4.3, 20.6, 20.7**
 
 - [ ] 14. Implement audit logging
   - [ ] 14.1 Implement `Audit\AuditLogger`

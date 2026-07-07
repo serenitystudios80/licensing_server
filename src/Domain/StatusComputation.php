@@ -5,28 +5,32 @@ declare(strict_types=1);
 namespace App\Domain;
 
 /**
- * StatusComputation result value object.
+ * StatusComputation - Result of StatusCalculator::compute().
  *
- * Immutable result of StatusCalculator::compute(), representing the true
- * current status derived from timestamps and the current time.
+ * Immutable value object representing the computed status transition result.
  *
- * Used by both the Sweep_Job (hourly cron) and the Lazy_Check (/validate endpoint)
- * to ensure they always agree on status transitions (Correctness Property 10).
- *
- * Per design.md StatusCalculator section and Requirements 5.5, 5.6, 10.2, 11.1.
+ * Per design.md StatusCalculator section.
  */
 final readonly class StatusComputation
 {
-    /**
-     * @param string $status Computed status: 'active', 'grace', or 'expired'
-     * @param bool $changed True if computed status differs from stored status
-     * @param int|null $graceStartTimestamp Unix epoch timestamp to set as grace_start_at
-     *                                       when transitioning active→grace for the first time.
-     *                                       Null if no grace transition or grace-start already set.
-     */
     public function __construct(
+        /**
+         * The computed status ('active', 'grace', or 'expired').
+         */
         public string $status,
+
+        /**
+         * Whether the status changed from the input License.
+         * True if a transition occurred, false if status stayed the same.
+         */
         public bool $changed,
+
+        /**
+         * The grace_start_at timestamp (Unix timestamp).
+         * - For active→grace: This is the current time ($now)
+         * - For grace→expired: This preserves the original grace_start_at
+         * - For no change: This preserves the existing grace_start_at (or null)
+         */
         public ?int $graceStartTimestamp,
     ) {
     }

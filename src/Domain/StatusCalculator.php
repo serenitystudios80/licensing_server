@@ -5,123 +5,113 @@ declare(strict_types=1);
 namespace App\Domain;
 
 /**
- * StatusCalculator - Pure function for license status computation.
+ * StatusCalculator - Pure function for license status transitions.
  *
- * This is the single most important shared component in the system.
- * It is a PURE FUNCTION with no side effects and no database access.
+ * Implements the active→grace→expired lifecycle for annual licenses:
+ * - active → grace: When expires_at is reached
+ * - grace → expired: 72 hours (259,200 seconds) after grace_start_at
  *
- * Both the Sweep_Job (hourly cron) and the Lazy_Check (/validate endpoint)
- * call this exact same function with the same inputs, guaranteeing they can
- * never disagree about status transitions (Correctness Property 10).
+ * This is a PURE function with no side effects - it only computes what the
+ * new status should be. Callers (Lazy_Check in /validate, Sweep_Job) are
+ * responsible for persisting the computed result.
  *
- * This design satisfies:
- * - Requirement 5 AC6: Lazy_Check never more favorable than Sweep_Job
- * - Requirement 11 AC2: grace-start timestamp never overwritten
- * - Requirements 10.2, 10.3, 11.1, 11.3, 11.4, 12.2, 12.3
+ * Lifetime and revoked licenses are excluded by callers before calling this.
  *
- * CRITICAL ASSUMPTIONS:
- * - Input License must be tier='annual' (callers pre-filter lifetime licenses)
- * - Input License must NOT be status='revoked' (callers pre-filter revoked licenses)
- * - The grace period is exactly 259,200 seconds (3 days)
+ * Per Requirements 5.5, 5.6, 5.7, 10.2, 10.3, 11.1, 11.3, 11.4, 12.2, 12.3
+ * and design.md StatusCalculator section.
  */
 final class StatusCalculator
 {
     /**
-     * Grace period duration in seconds: 3 days = 259,200 seconds.
-     * Per Requirements 10.2, 10.3.
+     * Grace period duration in seconds (72 hours = 3 days).
      */
-    private const GRACE_PERIOD_SECONDS = 259200; // 3 * 24 * 60 * 60
+    private const GRACE_PERIOD_SECONDS = 259200; // 72 hours * 3600 seconds
 
     /**
-     * Compute the true current status for an annual, non-revoked license.
+     * Compute the new status for a License.
+     *
+     * IMPORTANT: Callers must pre-filter out lifetime and revoked licenses.
+     * This function assumes the license is annual and non-revoked.
      *
      * Logic:
-     * 1. If status='active' AND expires_at <= now → transition to 'grace'
-     *    (silent lapse detection per Requirement 11.1)
-     * 2. If status='grace' AND (now - grace_start_at) >= 259,200 → transition to 'expired'
-     *    (grace expiry per Requirement 10.3)
-     * 3. Otherwise, status remains unchanged
+     * 1. If status is 'active' and expires_at <= now:
+     *    → Transition to 'grace', set grace_start_at = now
+     * 
+     * 2. If status is 'grace' and (now - grace_start_at) >= 259,200:
+     *    → Transition to 'expired', keep grace_start_at unchanged
      *
-     * Grace-start timestamp anchoring (Requirement 11 AC2):
-     * - graceStartTimestamp is only set when transitioning FROM 'active' TO 'grace'
-     * - If grace_start_at is already persisted in the License row, graceStartTimestamp is null
-     * - This ensures the grace period countdown is anchored to a single stable point,
-     *   regardless of which mechanism (Sweep_Job or Lazy_Check) first detects the lapse
+     * 3. Otherwise: No change
      *
-     * @param License $license The license to compute status for (must be tier='annual', status!='revoked')
-     * @param int $now Current Unix epoch timestamp (seconds)
-     * @return StatusComputation The computed status with metadata
+     * @param License $license The license to compute status for
+     * @param int $now Current Unix timestamp
+     * @return StatusComputation The computed result
      */
     public static function compute(License $license, int $now): StatusComputation
     {
         $currentStatus = $license->status;
-        $expiresAt = $license->expiresAt;
-        $graceStartAt = $license->graceStartAt;
 
-        // CASE 1: Active license with past expires_at → transition to grace
-        if ($currentStatus === 'active' && $expiresAt !== null) {
-            $expiresAtTimestamp = strtotime($expiresAt);
-            
-            if ($expiresAtTimestamp !== false && $expiresAtTimestamp <= $now) {
-                // Silent lapse detected: active → grace
-                // Set grace-start to now (only if not already set)
-                $graceStartTimestamp = ($graceStartAt === null) ? $now : null;
-                
-                return new StatusComputation(
-                    status: 'grace',
-                    changed: true,
-                    graceStartTimestamp: $graceStartTimestamp,
-                );
-            }
+        // Active → Grace transition
+        if ($currentStatus === 'active' && self::shouldTransitionToGrace($license, $now)) {
+            return new StatusComputation(
+                status: 'grace',
+                changed: true,
+                graceStartTimestamp: $now,
+            );
         }
 
-        // CASE 2: Grace license with elapsed grace period → transition to expired
-        if ($currentStatus === 'grace' && $graceStartAt !== null) {
-            $graceStartTimestamp = strtotime($graceStartAt);
-            
-            if ($graceStartTimestamp !== false) {
-                $elapsedGraceSeconds = $now - $graceStartTimestamp;
-                
-                if ($elapsedGraceSeconds >= self::GRACE_PERIOD_SECONDS) {
-                    // Grace period expired: grace → expired
-                    return new StatusComputation(
-                        status: 'expired',
-                        changed: true,
-                        graceStartTimestamp: null, // No grace-start change for grace→expired
-                    );
-                }
-            }
+        // Grace → Expired transition
+        if ($currentStatus === 'grace' && self::shouldTransitionToExpired($license, $now)) {
+            // Keep the original grace_start_at timestamp
+            $graceStartTimestamp = $license->graceStartAt !== null
+                ? strtotime($license->graceStartAt)
+                : null;
+
+            return new StatusComputation(
+                status: 'expired',
+                changed: true,
+                graceStartTimestamp: $graceStartTimestamp,
+            );
         }
 
-        // CASE 3: No transition - status remains as-is
+        // No change needed
         return new StatusComputation(
             status: $currentStatus,
             changed: false,
-            graceStartTimestamp: null,
+            graceStartTimestamp: $license->graceStartAt !== null
+                ? strtotime($license->graceStartAt)
+                : null,
         );
     }
 
     /**
-     * Check if a license should be excluded from status computation.
+     * Check if a license should transition from active to grace.
      *
-     * Filters out lifetime and revoked licenses per Requirements 12.5, 12.6.
-     * Both Sweep_Job and Lazy_Check must call this before compute().
-     *
-     * @param License $license The license to check
-     * @return bool True if license should be excluded (lifetime or revoked)
+     * Condition: expires_at <= now
      */
-    public static function shouldExclude(License $license): bool
+    private static function shouldTransitionToGrace(License $license, int $now): bool
     {
-        return $license->tier === 'lifetime' || $license->status === 'revoked';
+        if ($license->expiresAt === null) {
+            return false; // Lifetime licenses never expire
+        }
+
+        $expiresTimestamp = strtotime($license->expiresAt);
+        return $expiresTimestamp <= $now;
     }
 
     /**
-     * Get the grace period duration in seconds (for testing/documentation).
+     * Check if a license should transition from grace to expired.
      *
-     * @return int Grace period duration (259,200 seconds = 3 days)
+     * Condition: (now - grace_start_at) >= 259,200 seconds (72 hours)
      */
-    public static function getGracePeriodSeconds(): int
+    private static function shouldTransitionToExpired(License $license, int $now): bool
     {
-        return self::GRACE_PERIOD_SECONDS;
+        if ($license->graceStartAt === null) {
+            return false; // No grace period started yet
+        }
+
+        $graceStartTimestamp = strtotime($license->graceStartAt);
+        $graceElapsed = $now - $graceStartTimestamp;
+
+        return $graceElapsed >= self::GRACE_PERIOD_SECONDS;
     }
 }

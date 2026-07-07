@@ -12,17 +12,9 @@ use PDO;
 use PDOException;
 
 /**
- * Repository for AdminUser entities.
+ * AdminUserRepository - Repository for admin user authentication.
  *
- * Provides operations for finding and creating admin users.
- * The system supports only a single admin user (Requirement 13),
- * but the repository is designed to handle multiple rows if needed
- * in future extensions.
- *
- * Password hashing uses PHP's password_hash() / password_verify()
- * (bcrypt or argon2id depending on PHP version).
- *
- * All queries use PDO prepared statements exclusively.
+ * Per Requirements 13.4 and design.md Admin authentication section.
  */
 final class AdminUserRepository
 {
@@ -36,30 +28,32 @@ final class AdminUserRepository
     /**
      * Find an admin user by username.
      *
-     * Used by login authentication (Requirement 13).
-     *
-     * @param string $username Username (case-sensitive)
-     * @return AdminUser|null Returns null if not found
+     * @return AdminUser|null Returns null if not found.
+     * @throws \RuntimeException on database error.
      */
     public function findByUsername(string $username): ?AdminUser
     {
         try {
             $stmt = $this->pdo->prepare(
-                'SELECT * FROM admin_users WHERE username = ? LIMIT 1'
+                'SELECT * FROM admin_users WHERE username = :username LIMIT 1'
             );
-            $stmt->execute([$username]);
-            $row = $stmt->fetch();
+            $stmt->execute(['username' => $username]);
 
-            return $row ? AdminUser::fromRow($row) : null;
+            $row = $stmt->fetch();
+            if ($row === false) {
+                return null;
+            }
+
+            return AdminUser::fromRow($row);
         } catch (PDOException $e) {
             $context = ErrorContext::describe($e, [
                 'method' => __METHOD__,
                 'username' => $username,
             ]);
             Logger::error($context);
+
             throw new \RuntimeException(
-                "Failed to find admin user '{$username}': database query error. " .
-                "Check logs for details.",
+                'Failed to query admin user: database error',
                 0,
                 $e
             );
@@ -69,120 +63,120 @@ final class AdminUserRepository
     /**
      * Create a new admin user.
      *
-     * Password must already be hashed using password_hash() before calling this method.
-     * This repository does NOT hash passwords — that's the caller's responsibility
-     * (typically done in the registration/setup controller).
+     * @param array{
+     *     username: string,
+     *     password_hash: string,
+     * } $data
      *
-     * @param string $username Username (max 64 chars)
-     * @param string $passwordHash Pre-hashed password from password_hash()
-     * @return AdminUser The created AdminUser entity
-     * @throws \RuntimeException on creation failure
+     * @return AdminUser The newly created admin user.
+     * @throws \RuntimeException on database error.
      */
-    public function create(string $username, string $passwordHash): AdminUser
+    public function create(array $data): AdminUser
     {
         try {
             $stmt = $this->pdo->prepare(
-                'INSERT INTO admin_users (username, password_hash) VALUES (?, ?)'
+                'INSERT INTO admin_users (username, password_hash, created_at)
+                 VALUES (:username, :password_hash, NOW())'
             );
 
-            $stmt->execute([$username, $passwordHash]);
+            $stmt->execute([
+                'username' => $data['username'],
+                'password_hash' => $data['password_hash'],
+            ]);
 
             $id = (int) $this->pdo->lastInsertId();
 
-            // Fetch the created user to return full entity
-            $stmt = $this->pdo->prepare('SELECT * FROM admin_users WHERE id = ? LIMIT 1');
-            $stmt->execute([$id]);
-            $row = $stmt->fetch();
-
-            if (!$row) {
+            $created = $this->findByUsername($data['username']);
+            if ($created === null) {
                 throw new \RuntimeException(
-                    "Admin user created but could not be retrieved. User ID: {$id}"
+                    'Admin user was created but could not be retrieved'
                 );
             }
 
-            return AdminUser::fromRow($row);
+            return $created;
+        } catch (PDOException $e) {
+            $context = ErrorContext::describe($e, [
+                'method' => __METHOD__,
+                'username' => $data['username'],
+            ]);
+            Logger::error($context);
+
+            throw new \RuntimeException(
+                'Failed to create admin user: database error',
+                0,
+                $e
+            );
+        }
+    }
+
+    /**
+     * Record a login attempt.
+     *
+     * @param string $username Username attempted
+     * @param bool $successful Whether login succeeded
+     * @param string $ipAddress IP address of attempt
+     * @param int $timestamp Unix timestamp of attempt
+     */
+    public function recordLoginAttempt(
+        string $username,
+        bool $successful,
+        string $ipAddress,
+        int $timestamp
+    ): void {
+        try {
+            $stmt = $this->pdo->prepare(
+                'INSERT INTO admin_login_attempts (username, successful, ip_address, attempted_at)
+                 VALUES (:username, :successful, :ip_address, FROM_UNIXTIME(:timestamp))'
+            );
+
+            $stmt->execute([
+                'username' => $username,
+                'successful' => $successful ? 1 : 0,
+                'ip_address' => $ipAddress,
+                'timestamp' => $timestamp,
+            ]);
+        } catch (PDOException $e) {
+            // Log but don't throw - login attempt tracking should not block login
+            $context = ErrorContext::describe($e, [
+                'method' => __METHOD__,
+                'username' => $username,
+            ]);
+            Logger::error($context);
+        }
+    }
+
+    /**
+     * Count failed login attempts for a username within a time window.
+     *
+     * @param string $username Username to check
+     * @param int $sinceTimestamp Count attempts since this timestamp
+     * @return int Number of failed attempts
+     */
+    public function countFailedAttemptsSince(string $username, int $sinceTimestamp): int
+    {
+        try {
+            $stmt = $this->pdo->prepare(
+                'SELECT COUNT(*) FROM admin_login_attempts
+                 WHERE username = :username
+                   AND successful = 0
+                   AND attempted_at >= FROM_UNIXTIME(:since)'
+            );
+
+            $stmt->execute([
+                'username' => $username,
+                'since' => $sinceTimestamp,
+            ]);
+
+            return (int) $stmt->fetchColumn();
         } catch (PDOException $e) {
             $context = ErrorContext::describe($e, [
                 'method' => __METHOD__,
                 'username' => $username,
-                // password_hash intentionally omitted — Logger would redact it anyway
             ]);
             Logger::error($context);
 
-            // Check for duplicate username error
-            if ($e->getCode() === '23000' && strpos($e->getMessage(), 'uq_username') !== false) {
-                throw new \RuntimeException(
-                    "Failed to create admin user: username '{$username}' already exists. " .
-                    "Usernames must be unique.",
-                    0,
-                    $e
-                );
-            }
-
-            throw new \RuntimeException(
-                "Failed to create admin user '{$username}': database insert error. " .
-                "Check logs for details.",
-                0,
-                $e
-            );
-        }
-    }
-
-    /**
-     * Check if any admin users exist in the system.
-     *
-     * Used during initial setup to determine if the admin account needs
-     * to be created (not implemented in this spec, but useful for future setup flow).
-     *
-     * @return bool True if at least one admin user exists
-     */
-    public function exists(): bool
-    {
-        try {
-            $stmt = $this->pdo->query('SELECT COUNT(*) FROM admin_users');
-            return ((int) $stmt->fetchColumn()) > 0;
-        } catch (PDOException $e) {
-            $context = ErrorContext::describe($e, ['method' => __METHOD__]);
-            Logger::error($context);
-            throw new \RuntimeException(
-                "Failed to check admin user existence: database query error. " .
-                "Check logs for details.",
-                0,
-                $e
-            );
-        }
-    }
-
-    /**
-     * Find admin user by ID.
-     *
-     * Used for session management (Requirement 13).
-     *
-     * @param int $id Admin user ID
-     * @return AdminUser|null Returns null if not found
-     */
-    public function findById(int $id): ?AdminUser
-    {
-        try {
-            $stmt = $this->pdo->prepare(
-                'SELECT * FROM admin_users WHERE id = ? LIMIT 1'
-            );
-            $stmt->execute([$id]);
-            $row = $stmt->fetch();
-
-            return $row ? AdminUser::fromRow($row) : null;
-        } catch (PDOException $e) {
-            $context = ErrorContext::describe($e, [
-                'method' => __METHOD__,
-                'admin_user_id' => $id,
-            ]);
-            Logger::error($context);
-            throw new \RuntimeException(
-                "Failed to find admin user by ID {$id}: database query error. " .
-                "Check logs for details.",
-                0,
-                $e
-            );
+            // Fail-open: if we can't check, don't block login
+            return 0;
         }
     }
 }

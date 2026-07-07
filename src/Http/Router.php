@@ -5,74 +5,62 @@ declare(strict_types=1);
 namespace App\Http;
 
 /**
- * Simple HTTP router using PHP 8 match() expressions.
+ * Router - Match HTTP requests to handlers.
  *
- * Not a full-featured routing library — just a minimal dispatcher for the
- * fixed set of API endpoints: /activate, /validate, /deactivate, /webhook/razorpay.
+ * Simple match()-based router for API endpoints. Not a full framework router,
+ * just maps paths to handler identifiers.
  *
- * Returns a route match result indicating whether the route is defined and
- * which handler should process it.
+ * Supported routes:
+ * - POST /activate
+ * - POST /validate
+ * - POST /deactivate
+ * - POST /webhook/razorpay
+ * - POST /create-license
  *
- * Per design.md Request lifecycle (API) section and Requirements 20.2, 20.3.
+ * Per Requirements 20.2, 20.3 and design.md Request lifecycle section.
  */
 final class Router
 {
     /**
-     * Match a request path to a route.
-     *
-     * Returns a RouteMatch indicating:
-     * - found: whether the route is defined
-     * - handlerName: which handler class should process it (if found)
-     *
-     * Used by JsonBodyGuard (stage 2: route defined?) and front controller
-     * (stage 8: dispatch to business logic handler).
+     * @var array<string, string> Map of path => handler identifier
+     */
+    private const ROUTES = [
+        '/activate' => 'activate',
+        '/validate' => 'validate',
+        '/deactivate' => 'deactivate',
+        '/webhook/razorpay' => 'webhook',
+        '/create-license' => 'create-license',
+    ];
+
+    /**
+     * Match a request path to a handler identifier.
      *
      * @param string $path Request path (e.g., '/activate')
-     * @return RouteMatch
+     * @return string|null Handler identifier, or null if no match
      */
-    public function match(string $path): RouteMatch
+    public static function match(string $path): ?string
     {
-        $handlerName = match ($path) {
-            '/activate' => 'ActivateHandler',
-            '/validate' => 'ValidateHandler',
-            '/deactivate' => 'DeactivateHandler',
-            '/webhook/razorpay' => 'RazorpayWebhookHandler',
-            default => null,
-        };
-
-        return new RouteMatch(
-            found: $handlerName !== null,
-            handlerName: $handlerName,
-        );
+        return self::ROUTES[$path] ?? null;
     }
 
     /**
-     * Get all defined routes (for debugging/testing).
+     * Check if a path is a valid route.
      *
-     * @return array<string> Array of route paths
+     * @param string $path Request path
+     * @return bool True if route exists
      */
-    public function getRoutes(): array
+    public static function isValidRoute(string $path): bool
     {
-        return [
-            '/activate',
-            '/validate',
-            '/deactivate',
-            '/webhook/razorpay',
-        ];
+        return isset(self::ROUTES[$path]);
     }
-}
 
-/**
- * RouteMatch result value object.
- *
- * Returned by Router::match() to indicate whether a route was found
- * and which handler should process it.
- */
-final readonly class RouteMatch
-{
-    public function __construct(
-        public bool $found,
-        public ?string $handlerName,
-    ) {
+    /**
+     * Get all registered routes.
+     *
+     * @return array<string, string> Map of path => handler
+     */
+    public static function getRoutes(): array
+    {
+        return self::ROUTES;
     }
 }

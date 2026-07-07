@@ -8,24 +8,21 @@ namespace App\Domain;
  * AdminUser domain value object.
  *
  * Plain PHP object representing a row from the `admin_users` table.
- * This is not an ORM entity — just a typed container for row data with
- * readonly properties, used for hydration from database queries.
  *
- * Per Requirement 13.4 and design.md Data Models section.
- * The system supports only a single admin user (no multi-admin roles).
+ * Per Requirements 13.4 and design.md Data Models section.
  */
 final readonly class AdminUser
 {
     public function __construct(
         public int $id,
-        public string $username,         // max 64 characters
-        public string $passwordHash,     // bcrypt/argon2id hash from password_hash()
-        public string $createdAt,        // DATETIME string from DB (UTC)
+        public string $username,
+        public string $passwordHash,
+        public string $createdAt,
     ) {
     }
 
     /**
-     * Hydrate an AdminUser instance from a database row (associative array).
+     * Hydrate an AdminUser instance from a database row.
      *
      * @param array<string, mixed> $row
      */
