@@ -1,0 +1,17 @@
+# Environment secrets — never commit this file.
+.env
+
+# Dependencies
+/vendor/
+
+# Test / tool caches
+/.phpunit.cache/
+.phpunit.result.cache
+
+# Logs
+*.log
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
