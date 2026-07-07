@@ -7,7 +7,7 @@ CREATE TABLE license_events (
     license_id   BIGINT UNSIGNED NULL,   -- nullable only for webhook_unmatched (Req 7 AC7)
     event_type   VARCHAR(64)     NOT NULL,
     payload      JSON            NOT NULL,
-    webhook_event_id VARCHAR(128) GENERATED ALWAYS AS (JSON_UNQUOTE(payload->'$.webhook_event_id')) STORED,
+    webhook_event_id VARCHAR(128) GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(payload, '$.webhook_event_id'))) STORED,
     created_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     KEY idx_license_id_created (license_id, created_at),
     KEY idx_event_type (event_type),

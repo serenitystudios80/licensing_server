@@ -165,13 +165,11 @@ function applyMigration(PDO $pdo, string $filePath): void
     }
 
     try {
-        $pdo->beginTransaction();
         $pdo->exec($sql);
 
         $insert = $pdo->prepare('INSERT INTO schema_migrations (migration) VALUES (:migration)');
         $insert->execute(['migration' => $filename]);
 
-        $pdo->commit();
     } catch (PDOException $e) {
         if ($pdo->inTransaction()) {
             $pdo->rollBack();
